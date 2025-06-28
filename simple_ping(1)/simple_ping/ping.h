@@ -24,6 +24,8 @@
 #include <syslog.h>
 #include <pthread.h>
 #include <assert.h>
+#include <getopt.h>
+#include <math.h>
 #ifdef  HAVE_SOCKADDR_DL_STRUCT
 # include       <net/if_dl.h>
 #endif
@@ -96,11 +98,54 @@ void errorhandle(int m);
 void init_sd(void);
 void pushsd(int label,double num);
 void* pthread_fun(void *arg);
+void show_help(void);
+int validate_data_size(int size);
+char* get_timestamp(void);
+void timestamp_printf(const char *fmt, ...);
+void print_ipv4_header_verbose(struct ip *ip);
+void print_icmp_verbose(struct icmp *icmp, int icmplen);
+const char* get_icmp_type_name(int type);
+void adjust_adaptive_interval(double rtt);
+void handle_packet_loss(void);
+void fill_data_payload(char *buffer, int len);
+void fill_with_string(char *buffer, int len, const char *str);
+void output_json_results(void);
+void build_json_output(char *buffer, size_t bufsize);
+void get_iso_timestamp(char *buffer, size_t size);
+char* json_escape_string(const char *input);
+int init_log_system(const char *log_path);
+void write_log(const char *level, const char *format, ...);
+void log_info(const char *format, ...);
+void log_ping(const char *format, ...);
+void log_timeout(const char *format, ...);
+void log_error(const char *format, ...);
+void log_debug(const char *format, ...);
+void log_stats(const char *format, ...);
+void cleanup_log_system(void);
+void get_log_timestamp(char *buffer, size_t size);
 int freq=0; /*use for c*/
 int willfreq=0;
 int flowing =0;/*use for flow*/
 int quiet=0;/*use for q*/
 int havethread=0;/*use for flow*/
+int broadcast=0;/*use for b - broadcast*/
+int audible=0;/*use for a - audible beep*/
+int timestamp=0;/*use for time - timestamp*/
+int ttl_value=0;/*use for t - TTL setting, IPv4 only*/
+int deadline=0;/*use for w - total runtime deadline in seconds*/
+time_t start_time=0;/*record program start time for deadline check*/
+int adaptive=0;/*use for A - adaptive ping mode*/
+double adaptive_interval=1.0;/*dynamic interval for adaptive mode*/
+double last_rtt=0.0;/*last RTT for adaptive calculation*/
+int packet_loss_count=0;/*count consecutive packet losses*/
+int interval=1;/*use for i - interval between packets in seconds*/
+char *data_string=NULL;/*use for data-string - custom data payload*/
+int custom_data=0;/*flag: whether using custom data string*/
+int json_output=0;/*use for json - JSON format output*/
+char *json_output_file=NULL;/*JSON output file path*/
+int log_output=0;/*use for log - log file output*/
+char *log_file_path=NULL;/*log file path*/
+FILE *log_fp=NULL;/*log file pointer*/
 sdata sd;
 /*****************new add************/
 
