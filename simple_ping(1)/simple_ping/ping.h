@@ -107,6 +107,7 @@ void print_icmp_verbose(struct icmp *icmp, int icmplen);
 const char* get_icmp_type_name(int type);
 void adjust_adaptive_interval(double rtt);
 void handle_packet_loss(void);
+int check_deadline(void);
 void fill_data_payload(char *buffer, int len);
 void fill_with_string(char *buffer, int len, const char *str);
 void output_json_results(void);

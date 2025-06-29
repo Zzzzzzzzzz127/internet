@@ -19,10 +19,6 @@ main(int argc, char **argv)
 /**************new add ***************************/
 	signal(SIGINT, sigint_handler);
 	init_sd();
-	/* 记录程序开始时间用于deadline检查 */
-	if (deadline > 0) {
-		start_time = time(NULL);
-	}
 /**************new add ***************************/
 
 	/* 定义长选项 */
@@ -190,6 +186,11 @@ main(int argc, char **argv)
 		log_info("PING %s (%s): %d data bytes", ai->ai_canonname,
 		   		Sock_ntop_host(ai->ai_addr, ai->ai_addrlen), datalen);
 	}
+	
+	/* 如果设置了TTL，给出说明 */
+	if (ttl_value > 0) {
+		timestamp_printf("Note: Outgoing packets will use TTL=%d (reply_ttl shows the TTL of incoming reply packets)\n", ttl_value);
+	}
 
 		/* 根据协议类型进行初始化 */
 	if (ai->ai_family == AF_INET) {
@@ -207,6 +208,20 @@ main(int argc, char **argv)
 	pr->sasend = ai->ai_addr;
 	pr->sarecv = calloc(1, ai->ai_addrlen);
 	pr->salen = ai->ai_addrlen;
+
+	/* 现在所有参数都已解析完成，如果设置了deadline，记录开始时间 */
+	if (deadline > 0) {
+		start_time = time(NULL);
+		log_info("Deadline set to %d seconds, ping will stop at %ld", deadline, start_time + deadline);
+		
+		/* 如果deadline非常短，给出警告 */
+		if (deadline < 3) {
+			timestamp_printf("Warning: Very short deadline (%d seconds), may not get meaningful results\n", deadline);
+		}
+		
+		/* 立即检查一次，以防deadline已经过期 */
+		check_deadline();
+	}
 
 	readloop();
 
@@ -275,15 +290,27 @@ proc_v4(char *ptr, ssize_t len, struct timeval *tvrecv)
 		//服务器返回的时间戳是我们一开始发给他的
 		/***************change********** */
 		if(!flowing&&!quiet){
-			timestamp_printf("%d bytes from %s: seq=%u, ttl=%d, rtt=%.3f ms\n",
-				icmplen, Sock_ntop_host(pr->sarecv, pr->salen),
-				icmp->icmp_seq, ip->ip_ttl, rtt);
+			if (ttl_value > 0) {
+				timestamp_printf("%d bytes from %s: seq=%u, reply_ttl=%d (sent_ttl=%d), rtt=%.3f ms\n",
+					icmplen, Sock_ntop_host(pr->sarecv, pr->salen),
+					icmp->icmp_seq, ip->ip_ttl, ttl_value, rtt);
+			} else {
+				timestamp_printf("%d bytes from %s: seq=%u, ttl=%d, rtt=%.3f ms\n",
+					icmplen, Sock_ntop_host(pr->sarecv, pr->salen),
+					icmp->icmp_seq, ip->ip_ttl, rtt);
+			}
 		}
 		
 		/* 记录ping响应日志 */
-		log_ping("%d bytes from %s: seq=%u, ttl=%d, rtt=%.3f ms",
-			icmplen, Sock_ntop_host(pr->sarecv, pr->salen),
-			icmp->icmp_seq, ip->ip_ttl, rtt);
+		if (ttl_value > 0) {
+			log_ping("%d bytes from %s: seq=%u, reply_ttl=%d (sent_ttl=%d), rtt=%.3f ms",
+				icmplen, Sock_ntop_host(pr->sarecv, pr->salen),
+				icmp->icmp_seq, ip->ip_ttl, ttl_value, rtt);
+		} else {
+			log_ping("%d bytes from %s: seq=%u, ttl=%d, rtt=%.3f ms",
+				icmplen, Sock_ntop_host(pr->sarecv, pr->salen),
+				icmp->icmp_seq, ip->ip_ttl, rtt);
+		}
 		
 		if(flowing)
 			printf("\b");
@@ -336,6 +363,10 @@ proc_v4(char *ptr, ssize_t len, struct timeval *tvrecv)
 			adjust_adaptive_interval(rtt);
 			packet_loss_count = 0; /* 收到回复，重置丢包计数 */
 		}
+		
+		/* 收到IPv4数据包后检查deadline */
+		check_deadline();
+		
 		/***************change********** */
 	} else if (verbose) {
 		//v参数？
@@ -467,6 +498,10 @@ proc_v6(char *ptr, ssize_t len, struct timeval* tvrecv)
 			adjust_adaptive_interval(rtt);
 			packet_loss_count = 0; /* 收到回复，重置丢包计数 */
 		}
+		
+		/* 收到IPv6数据包后检查deadline */
+		check_deadline();
+		
 		/***************change********** */
 	} else if (verbose) {
 		timestamp_printf("  %d bytes from %s: type = %d, code = %d\n",
@@ -637,25 +672,39 @@ readloop(void)
 		if (setsockopt(sockfd, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on)) < 0) {
 			err_sys("setsockopt SO_BROADCAST error");
 		}
+		/* 检查是否为广播地址并给出提示 */
+		struct sockaddr_in *sin = (struct sockaddr_in *)pr->sasend;
+		if ((ntohl(sin->sin_addr.s_addr) & 0xFF) == 0xFF) {
+			timestamp_printf("Note: Broadcasting to %s - most devices don't respond to broadcast pings (this is normal)\n", 
+			                Sock_ntop_host(pr->sasend, pr->salen));
+		}
 	} else if (broadcast && pr->sasend->sa_family == AF_INET6) {
 		timestamp_printf("Warning: broadcast option (-b) is not supported for IPv6\n");
 	}    
 	sig_alrm(SIGALRM);		/* 发送第一个数据包 */
 
 	for ( ; ; ) {
+		/* 在每次循环开始时检查deadline */
+		check_deadline();
+		
 		len = pr->salen;
 		n = recvfrom(sockfd, recvbuf, sizeof(recvbuf), 0, pr->sarecv, &len);
 		//                                                保存发送数据的源地址，以及对应的地址长度
 		if (n < 0) {
-			if (errno == EINTR)
+			if (errno == EINTR) {
+				/* 被信号中断，这是检查deadline的好时机 */
+				check_deadline();
 				continue;
-			else
+			} else
 				err_sys("recvfrom error");
 		}
 
 		gettimeofday(&tval, NULL);
 		//接受到返回消息时的时间
 		(*pr->fproc)(recvbuf, n, &tval);
+		
+		/* 处理完数据包后再次检查deadline */
+		check_deadline();
 	}
 }
 
@@ -664,14 +713,7 @@ sig_alrm(int signo)
 {
 /*******************change*********************** */
 		/* 检查deadline */
-		if (deadline > 0 && start_time > 0) {
-			time_t current_time = time(NULL);
-			if (current_time - start_time >= deadline) {
-				timestamp_printf("\n--- %s ping statistics (deadline reached) ---\n", host);
-				sigint_handler(SIGINT);
-				return;
-			}
-		}
+		check_deadline();
 		
 		pthread_t tid;
 		if(flowing){
@@ -876,6 +918,11 @@ void sigint_handler(int sig){
 			   sd.send, sd.recv, 
 			   sd.send > 0 ? (100 - (double)sd.recv/sd.send*100) : 0);
 			
+			/* 在广播模式下提供额外说明 */
+			if (broadcast && sd.recv == 0) {
+				timestamp_printf("Note: 100%% packet loss in broadcast mode is normal - most devices don't respond to broadcast pings\n");
+			}
+			
 			if (sd.recv > 0) {
 				double sum=0;
 				if(sd.size>1000)
@@ -977,9 +1024,9 @@ void show_help(void){
     printf("  -q          静默模式 - 减少输出信息\n");
     printf("  -s <大小>   指定发送的数据字节数 (0-1472)\n");
     printf("  -h          显示此帮助信息\n");
-    printf("  -b          允许ping广播地址 (仅IPv4)\n");
+    printf("  -b          允许ping广播地址 (仅IPv4, 通常无回复)\n");
     printf("  -a          成功回复时发出声音提示\n");
-    printf("  -t <ttl>    设置TTL值 (1-255, 仅IPv4)\n");
+    printf("  -t <ttl>    设置发送包的TTL值 (1-255, 仅IPv4)\n");
     printf("  -T          为每行添加时间戳\n");
     printf("  -w <秒数>   指定秒数后停止 (运行时间限制)\n");
     printf("  -A          适应性模式 - 根据RTT自动调整间隔\n");
@@ -991,7 +1038,7 @@ void show_help(void){
     printf("\n使用示例:\n");
     printf("  ping baidu.com\n");
     printf("  ping -c 4 -s 1000 baidu.com\n");
-    printf("  ping -b 192.168.1.255\n");
+    printf("  ping -b 192.168.1.255    # 广播ping (通常无回复)\n");
     printf("  ping -a -T baidu.com\n");
     printf("  ping -t 64 baidu.com\n");
     printf("  ping -w 10 baidu.com\n");
@@ -1144,6 +1191,61 @@ void adjust_adaptive_interval(double rtt) {
         timestamp_printf("    Adaptive interval adjusted to %.2f seconds (RTT: %.3f ms)\n", 
                         adaptive_interval, rtt);
     }
+}
+
+/* 检查deadline是否到期 */
+int check_deadline(void) {
+	if (deadline > 0 && start_time > 0) {
+		time_t current_time = time(NULL);
+		time_t elapsed = current_time - start_time;
+		
+		if (elapsed >= deadline) {
+			if (verbose) {
+				timestamp_printf("Deadline reached: %ld seconds elapsed (limit: %d)\n", 
+				                elapsed, deadline);
+			}
+			log_info("Deadline reached after %ld seconds", elapsed);
+			
+			/* 输出统计信息并退出 */
+			if (json_output) {
+				fprintf(stderr, "\n");  /* 清理进度提示行 */
+				output_json_results();
+			} else {
+				timestamp_printf("\n--- %s ping statistics (deadline reached) ---\n", host);
+				timestamp_printf("%d packets transmitted, %d received, %.0f%% packet loss\n",
+				   sd.send, sd.recv, 
+				   sd.send > 0 ? (100 - (double)sd.recv/sd.send*100) : 0);
+				
+				if (sd.recv > 0) {
+					double sum=0;
+					int count = sd.size > 1000 ? 1000 : sd.size;
+					for(int i=0;i<count;i++)
+						sum+=sd.data[i];
+					double avg = sum/count;
+					
+					timestamp_printf("round-trip min/avg/max = %.3f/%.3f/%.3f ms\n",
+					   sd.min, avg, sd.max);
+				}
+			}
+			
+			/* 清理并退出 */
+			if (log_output) {
+				cleanup_log_system();
+			}
+			exit(0);
+		}
+		
+		/* 如果接近deadline，给出警告 */
+		if (elapsed > deadline * 0.9 && elapsed < deadline) {
+			static int warning_given = 0;
+			if (!warning_given && verbose) {
+				timestamp_printf("Warning: Approaching deadline (%.1f%% elapsed)\n", 
+				                (double)elapsed / deadline * 100);
+				warning_given = 1;
+			}
+		}
+	}
+	return 0;  /* 未到期 */
 }
 
 /* 处理丢包情况 */
