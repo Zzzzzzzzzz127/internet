@@ -26,6 +26,7 @@
 #include <assert.h>
 #include <getopt.h>
 #include <math.h>
+#include <stdint.h>
 #ifdef  HAVE_SOCKADDR_DL_STRUCT
 # include       <net/if_dl.h>
 #endif

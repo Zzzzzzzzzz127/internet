@@ -148,12 +148,15 @@ main(int argc, char **argv)
 	
 		/* 处理--json模式的交互 */
 	if (json_output) {
-		/* JSON模式下自动启用静默模式，除非用户明确指定了详细模式 */
-		if (!verbose) {
-			quiet = 1;
-		}
 		/* JSON模式下显示一个进度提示 */
 		fprintf(stderr, "Running ping test (Press Ctrl+C to stop and see results)...\n");
+		/* 注意：JSON模式不自动设置quiet，让用户自己决定是否要看到ping过程 */
+		/* 增加调试信息以帮助诊断问题 */
+		if (verbose) {
+			fprintf(stderr, "Debug: JSON mode enabled, verbose output will show packet processing details\n");
+		} else {
+			fprintf(stderr, "Tip: Use '-v' with --json for detailed debugging if no packets are received\n");
+		}
 	}
 	
 	/* 初始化日志系统 */
@@ -257,34 +260,48 @@ proc_v4(char *ptr, ssize_t len, struct timeval *tvrecv)
 		if (icmplen < 16)
 			err_quit("icmplen (%d) < 16", icmplen);
 
-		tvsend = (struct timeval *) icmp->icmp_data;
+		/* 从网络字节序的32位整数对中安全地读取时间戳 */
+		uint32_t *time_data = (uint32_t *) icmp->icmp_data;
+		struct timeval tvsend_safe;
+		tvsend_safe.tv_sec = (time_t)ntohl(time_data[0]);   /* 转换秒部分 */
+		tvsend_safe.tv_usec = (suseconds_t)ntohl(time_data[1]); /* 转换微秒部分 */
+		tvsend = &tvsend_safe;
 		
 		/* 调试：检查时间戳合理性 */
+		time_t current_time = time(NULL);
 		if (verbose) {
-			log_debug("Send timestamp: tv_sec=%ld, tv_usec=%ld", tvsend->tv_sec, tvsend->tv_usec);
-			log_debug("Recv timestamp: tv_sec=%ld, tv_usec=%ld", tvrecv->tv_sec, tvrecv->tv_usec);
+			timestamp_printf("Debug: Send timestamp: tv_sec=%ld, tv_usec=%ld\n", tvsend->tv_sec, tvsend->tv_usec);
+			timestamp_printf("Debug: Recv timestamp: tv_sec=%ld, tv_usec=%ld\n", tvrecv->tv_sec, tvrecv->tv_usec);
+			timestamp_printf("Debug: Current time: %ld\n", current_time);
 		}
 		
 		/* 检查发送时间戳的合理性 */
-		time_t current_time = time(NULL);
-		if (tvsend->tv_sec < 0 || tvsend->tv_sec > current_time + 3600 || 
-		    tvsend->tv_usec < 0 || tvsend->tv_usec >= 1000000) {
+		if (tvsend->tv_sec < 0 || tvsend->tv_usec < 0 || tvsend->tv_usec >= 1000000) {
 			if (verbose) {
-				timestamp_printf("Warning: Invalid send timestamp, packet ignored\n");
+				timestamp_printf("Warning: Invalid timestamp format (%ld.%06ld), packet ignored\n", 
+				                tvsend->tv_sec, tvsend->tv_usec);
 			}
-			return;  /* 忽略损坏的数据包 */
+			return;  /* 忽略格式损坏的数据包 */
+		}
+		
+		/* 检查时间戳是否在合理范围内 */
+		if (tvsend->tv_sec < current_time - 86400 || tvsend->tv_sec > current_time + 60) {
+			if (verbose) {
+				timestamp_printf("Warning: Timestamp out of reasonable range (%ld.%06ld vs current %ld), packet ignored\n", 
+				                tvsend->tv_sec, tvsend->tv_usec, current_time);
+			}
+			return;  /* 忽略时间异常的数据包 */
 		}
 		
 		tv_sub(tvrecv, tvsend);
 		rtt = tvrecv->tv_sec * 1000.0 + tvrecv->tv_usec / 1000.0;
 		
-		/* 检查RTT合理性 - 应该在0到60000ms之间 */
-		if (rtt < 0.0 || rtt > 60000.0) {
+		/* 检查RTT合理性 - 只过滤明显异常的值 */
+		if (rtt < -1000.0 || rtt > 300000.0) {  /* 只过滤极端异常：负1秒到5分钟 */
 			if (verbose) {
-				timestamp_printf("Warning: Invalid RTT %.3f ms (send: %ld.%06ld, recv: %ld.%06ld), packet ignored\n", 
+				timestamp_printf("Warning: Extreme RTT %.3f ms (send: %ld.%06ld, recv: %ld.%06ld), packet ignored\n", 
 				                rtt, tvsend->tv_sec, tvsend->tv_usec, tvrecv->tv_sec, tvrecv->tv_usec);
 			}
-			log_error("Invalid RTT calculation: %.3f ms", rtt);
 			return;  /* 忽略这个异常的数据包 */
 		}
 		//服务器返回的时间戳是我们一开始发给他的
@@ -322,7 +339,7 @@ proc_v4(char *ptr, ssize_t len, struct timeval *tvrecv)
 		}
 		
 		/* 记录详细信息到调试日志 */
-		if (verbose) {
+		if (verbose && log_output) {
 			log_debug("IP Header: version=%d, ttl=%d, protocol=%d", 
 			         ip->ip_v, ip->ip_ttl, ip->ip_p);
 			log_debug("ICMP Header: type=%d, code=%d, id=%d, seq=%d",
@@ -356,16 +373,20 @@ proc_v4(char *ptr, ssize_t len, struct timeval *tvrecv)
 		
 		/* 适应性模式调整 */
 		if (adaptive) {
-			/* 如果有连续丢包，先处理丢包情况 */
-			if (packet_loss_count > 1) {
-				handle_packet_loss();
+			/* 收到回复说明网络正常，重置连续丢包计数 */
+			if (packet_loss_count > 0) {
+				if (verbose && !quiet) {
+					timestamp_printf("    Network recovered, resetting loss count from %d to 0\n", packet_loss_count);
+				}
+				packet_loss_count = 0;
 			}
 			adjust_adaptive_interval(rtt);
-			packet_loss_count = 0; /* 收到回复，重置丢包计数 */
 		}
 		
 		/* 收到IPv4数据包后检查deadline */
-		check_deadline();
+		if (deadline > 0) {
+			check_deadline();
+		}
 		
 		/***************change********** */
 	} else if (verbose) {
@@ -403,34 +424,48 @@ proc_v6(char *ptr, ssize_t len, struct timeval* tvrecv)
 		if (icmp6len < 16)
 			err_quit("icmp6len (%d) < 16", icmp6len);
 
-		tvsend = (struct timeval *) (icmp6 + 1);
+		/* 从网络字节序的32位整数对中安全地读取时间戳 */
+		uint32_t *time_data = (uint32_t *) (icmp6 + 1);
+		struct timeval tvsend_safe;
+		tvsend_safe.tv_sec = (time_t)ntohl(time_data[0]);   /* 转换秒部分 */
+		tvsend_safe.tv_usec = (suseconds_t)ntohl(time_data[1]); /* 转换微秒部分 */
+		tvsend = &tvsend_safe;
 		
 		/* 调试：检查时间戳合理性 */
+		time_t current_time = time(NULL);
 		if (verbose) {
-			log_debug("IPv6 Send timestamp: tv_sec=%ld, tv_usec=%ld", tvsend->tv_sec, tvsend->tv_usec);
-			log_debug("IPv6 Recv timestamp: tv_sec=%ld, tv_usec=%ld", tvrecv->tv_sec, tvrecv->tv_usec);
+			timestamp_printf("Debug IPv6: Send timestamp: tv_sec=%ld, tv_usec=%ld\n", tvsend->tv_sec, tvsend->tv_usec);
+			timestamp_printf("Debug IPv6: Recv timestamp: tv_sec=%ld, tv_usec=%ld\n", tvrecv->tv_sec, tvrecv->tv_usec);
+			timestamp_printf("Debug IPv6: Current time: %ld\n", current_time);
 		}
 		
 		/* 检查发送时间戳的合理性 */
-		time_t current_time = time(NULL);
-		if (tvsend->tv_sec < 0 || tvsend->tv_sec > current_time + 3600 || 
-		    tvsend->tv_usec < 0 || tvsend->tv_usec >= 1000000) {
+		if (tvsend->tv_sec < 0 || tvsend->tv_usec < 0 || tvsend->tv_usec >= 1000000) {
 			if (verbose) {
-				timestamp_printf("Warning: Invalid IPv6 send timestamp, packet ignored\n");
+				timestamp_printf("Warning: Invalid IPv6 timestamp format (%ld.%06ld), packet ignored\n",
+				                tvsend->tv_sec, tvsend->tv_usec);
 			}
-			return;  /* 忽略损坏的数据包 */
+			return;  /* 忽略格式损坏的数据包 */
+		}
+		
+		/* 检查时间戳是否在合理范围内 */
+		if (tvsend->tv_sec < current_time - 86400 || tvsend->tv_sec > current_time + 60) {
+			if (verbose) {
+				timestamp_printf("Warning: IPv6 timestamp out of reasonable range (%ld.%06ld vs current %ld), packet ignored\n",
+				                tvsend->tv_sec, tvsend->tv_usec, current_time);
+			}
+			return;  /* 忽略时间异常的数据包 */
 		}
 		
 		tv_sub(tvrecv, tvsend);
 		rtt = tvrecv->tv_sec * 1000.0 + tvrecv->tv_usec / 1000.0;
 		
-		/* 检查RTT合理性 - 应该在0到60000ms之间 */
-		if (rtt < 0.0 || rtt > 60000.0) {
+		/* 检查RTT合理性 - 只过滤明显异常的值 */
+		if (rtt < -1000.0 || rtt > 300000.0) {  /* 只过滤极端异常：负1秒到5分钟 */
 			if (verbose) {
-				timestamp_printf("Warning: Invalid IPv6 RTT %.3f ms (send: %ld.%06ld, recv: %ld.%06ld), packet ignored\n", 
+				timestamp_printf("Warning: Extreme IPv6 RTT %.3f ms (send: %ld.%06ld, recv: %ld.%06ld), packet ignored\n", 
 				                rtt, tvsend->tv_sec, tvsend->tv_usec, tvrecv->tv_sec, tvrecv->tv_usec);
 			}
-			log_error("Invalid IPv6 RTT calculation: %.3f ms", rtt);
 			return;  /* 忽略这个异常的数据包 */
 		}
 		/***************change********** */
@@ -457,7 +492,7 @@ proc_v6(char *ptr, ssize_t len, struct timeval* tvrecv)
 		}
 		
 		/* 记录IPv6详细信息到调试日志 */
-		if (verbose) {
+		if (verbose && log_output) {
 			log_debug("IPv6 Header: version=%d, hlim=%d", 
 			         (ip6->ip6_vfc >> 4) & 0xf, ip6->ip6_hlim);
 			log_debug("ICMPv6 Header: type=%d, code=%d, id=%d, seq=%d",
@@ -491,16 +526,20 @@ proc_v6(char *ptr, ssize_t len, struct timeval* tvrecv)
 		
 		/* 适应性模式调整 */
 		if (adaptive) {
-			/* 如果有连续丢包，先处理丢包情况 */
-			if (packet_loss_count > 1) {
-				handle_packet_loss();
+			/* 收到回复说明网络正常，重置连续丢包计数 */
+			if (packet_loss_count > 0) {
+				if (verbose && !quiet) {
+					timestamp_printf("    IPv6 network recovered, resetting loss count from %d to 0\n", packet_loss_count);
+				}
+				packet_loss_count = 0;
 			}
 			adjust_adaptive_interval(rtt);
-			packet_loss_count = 0; /* 收到回复，重置丢包计数 */
 		}
 		
 		/* 收到IPv6数据包后检查deadline */
-		check_deadline();
+		if (deadline > 0) {
+			check_deadline();
+		}
 		
 		/***************change********** */
 	} else if (verbose) {
@@ -576,11 +615,15 @@ send_v4(void)
 	icmp->icmp_code = 0;//代码0
 	icmp->icmp_id = pid;//标识符
 	icmp->icmp_seq = nsent++;//序号
-	gettimeofday((struct timeval *) icmp->icmp_data, NULL);
-	/*获取当前时间，放到time_val结构体中，成员变量：
-		long  tv_sec; 秒
-    	long  tv_usec; 微秒
-	*/
+	
+	/* 安全的时间戳存储方式 - 避免对齐和字节序问题 */
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	
+	/* 将时间戳转换为网络字节序的32位整数对存储 */
+	uint32_t *time_data = (uint32_t *) icmp->icmp_data;
+	time_data[0] = htonl((uint32_t)tv.tv_sec);   /* 秒部分 */
+	time_data[1] = htonl((uint32_t)tv.tv_usec);  /* 微秒部分 */
 	
 	/* 填充自定义数据到时间戳之后的区域 */
 	if (datalen > 8) {  /* 如果有额外的数据空间 */
@@ -594,7 +637,9 @@ send_v4(void)
 	sendto(sockfd, sendbuf, len, 0, pr->sasend, pr->salen);
 	
 	/* 记录发送日志 */
-	log_debug("Sent ICMP packet: seq=%u, len=%d bytes", icmp->icmp_seq, len);
+	if (verbose && log_output) {
+		log_debug("Sent ICMP packet: seq=%u, len=%d bytes", icmp->icmp_seq, len);
+	}
 	
 	/*用于发送信息
 	参数
@@ -619,7 +664,15 @@ send_v6()
 	icmp6->icmp6_code = 0;
 	icmp6->icmp6_id = pid;
 	icmp6->icmp6_seq = nsent++;
-	gettimeofday((struct timeval *) (icmp6 + 1), NULL);
+	
+	/* 安全的时间戳存储方式 - 避免对齐和字节序问题 */
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	
+	/* 将时间戳转换为网络字节序的32位整数对存储 */
+	uint32_t *time_data = (uint32_t *) (icmp6 + 1);
+	time_data[0] = htonl((uint32_t)tv.tv_sec);   /* 秒部分 */
+	time_data[1] = htonl((uint32_t)tv.tv_usec);  /* 微秒部分 */
 	
 	/* 填充自定义数据到时间戳之后的区域 */
 	if (datalen > 8) {  /* 如果有额外的数据空间 */
@@ -631,7 +684,9 @@ send_v6()
 	sendto(sockfd, sendbuf, len, 0, pr->sasend, pr->salen);
 	
 	/* 记录IPv6发送日志 */
-	log_debug("Sent ICMPv6 packet: seq=%u, len=%d bytes", icmp6->icmp6_seq, len);
+	if (verbose && log_output) {
+		log_debug("Sent ICMPv6 packet: seq=%u, len=%d bytes", icmp6->icmp6_seq, len);
+	}
 	
 		/* 内核会为我们计算并存储校验和 */
 #endif	/* IPV6 */
@@ -685,7 +740,9 @@ readloop(void)
 
 	for ( ; ; ) {
 		/* 在每次循环开始时检查deadline */
-		check_deadline();
+		if (deadline > 0) {
+			check_deadline();
+		}
 		
 		len = pr->salen;
 		n = recvfrom(sockfd, recvbuf, sizeof(recvbuf), 0, pr->sarecv, &len);
@@ -693,7 +750,9 @@ readloop(void)
 		if (n < 0) {
 			if (errno == EINTR) {
 				/* 被信号中断，这是检查deadline的好时机 */
-				check_deadline();
+				if (deadline > 0) {
+					check_deadline();
+				}
 				continue;
 			} else
 				err_sys("recvfrom error");
@@ -704,7 +763,9 @@ readloop(void)
 		(*pr->fproc)(recvbuf, n, &tval);
 		
 		/* 处理完数据包后再次检查deadline */
-		check_deadline();
+		if (deadline > 0) {
+			check_deadline();
+		}
 	}
 }
 
@@ -713,7 +774,27 @@ sig_alrm(int signo)
 {
 /*******************change*********************** */
 		/* 检查deadline */
-		check_deadline();
+		if (deadline > 0) {
+			check_deadline();
+		}
+		
+		/* 自适应模式：如果再次收到alarm说明上一个包可能超时了 */
+		if (adaptive && sd.send > sd.recv) {
+			/* 有未收到回复的数据包，可能是超时了 */
+			int lost_packets = sd.send - sd.recv;
+			if (lost_packets > 0) {
+				packet_loss_count++;
+				if (verbose && !quiet) {
+					timestamp_printf("    Timeout detected, loss count: %d (sent: %d, recv: %d)\n", 
+					                packet_loss_count, sd.send, sd.recv);
+				}
+				
+				/* 处理连续丢包情况 */
+				if (packet_loss_count > 1) {
+					handle_packet_loss();
+				}
+			}
+		}
 		
 		pthread_t tid;
 		if(flowing){
@@ -736,9 +817,13 @@ sig_alrm(int signo)
 		        else if(!willfreq){
         	(*pr->fsend)();
         	if (adaptive) {
-        		alarm((unsigned int)adaptive_interval);
-        		/* 自适应模式下，每次发送都视为潜在的丢包（将在收到回复时重置） */
-        		packet_loss_count++;
+        		/* 确保自适应间隔至少为1秒，避免alarm(0)导致停止发送 */
+        		unsigned int alarm_interval = (unsigned int)(adaptive_interval + 0.5);  /* 四舍五入 */
+        		if (alarm_interval < 1) alarm_interval = 1;  /* 最小1秒 */
+        		alarm(alarm_interval);
+        		
+        		/* 只有在真正没收到回复时才算丢包，而不是每次发送都增加 */
+        		/* packet_loss_count的增加放到真正的超时处理中 */
         	} else {
         		alarm(interval); /* 使用用户指定的间隔 */
         	}
@@ -747,9 +832,13 @@ sig_alrm(int signo)
 		else if(willfreq&&freq){
 			(*pr->fsend)();
         	if (adaptive) {
-        		alarm((unsigned int)adaptive_interval);
-        		/* 自适应模式下，每次发送都视为潜在的丢包（将在收到回复时重置） */
-        		packet_loss_count++;
+        		/* 确保自适应间隔至少为1秒，避免alarm(0)导致停止发送 */
+        		unsigned int alarm_interval = (unsigned int)(adaptive_interval + 0.5);  /* 四舍五入 */
+        		if (alarm_interval < 1) alarm_interval = 1;  /* 最小1秒 */
+        		alarm(alarm_interval);
+        		
+        		/* 只有在真正没收到回复时才算丢包，而不是每次发送都增加 */
+        		/* packet_loss_count的增加放到真正的超时处理中 */
         	} else {
         		alarm(interval); /* 使用用户指定的间隔 */
         	}
@@ -1157,8 +1246,8 @@ void adjust_adaptive_interval(double rtt) {
     /* 如果RTT很低(<50ms)，缩短间隔以获得更快的探测 */
     if (rtt < 50.0) {
         adaptive_interval = adaptive_interval * 0.9;
-        if (adaptive_interval < 0.1) {
-            adaptive_interval = 0.1; /* 最小间隔100ms */
+        if (adaptive_interval < 1.0) {
+            adaptive_interval = 1.0; /* 最小间隔1秒，避免alarm(0)问题 */
         }
     }
     /* 如果RTT适中(50-200ms)，保持当前间隔 */
@@ -1195,7 +1284,10 @@ void adjust_adaptive_interval(double rtt) {
 
 /* 检查deadline是否到期 */
 int check_deadline(void) {
-	if (deadline > 0 && start_time > 0) {
+	/* 如果没有设置deadline，直接返回 */
+	if (deadline <= 0) return 0;
+	
+	if (start_time > 0) {
 		time_t current_time = time(NULL);
 		time_t elapsed = current_time - start_time;
 		
