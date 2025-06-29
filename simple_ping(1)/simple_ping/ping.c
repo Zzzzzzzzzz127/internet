@@ -712,7 +712,7 @@ err_doit(int errnoflag, int level, const char *fmt, va_list ap)
         strcat(buf, "\n");
 
         if (daemon_proc) {
-                syslog(level, buf);
+                syslog(level, "%s", buf);
         } else {
                 fflush(stdout);         /* in case stdout and stderr are the same */
                 fputs(buf, stderr);
@@ -904,7 +904,7 @@ int validate_data_size(int size){
 }
 
 char* get_timestamp(void){
-    static char timestamp_buf[32];
+    static char timestamp_buf[64];
     struct timeval tv;
     struct tm *tm_info;
     
@@ -1065,7 +1065,7 @@ void get_iso_timestamp(char *buffer, size_t size) {
     strftime(buffer, size, "%Y-%m-%dT%H:%M:%S", tm_info);
     
     /* 添加毫秒精度 */
-    char ms_buffer[8];
+    char ms_buffer[16];
     snprintf(ms_buffer, sizeof(ms_buffer), ".%03ld", tv.tv_usec / 1000);
     strncat(buffer, ms_buffer, size - strlen(buffer) - 1);
     strncat(buffer, "Z", size - strlen(buffer) - 1);
@@ -1232,10 +1232,12 @@ void get_log_timestamp(char *buffer, size_t size) {
     tm_info = localtime(&tv.tv_sec);
     
     /* 日志时间戳格式: [YYYY-MM-DD HH:MM:SS.mmm] */
-    snprintf(buffer, size, "[%04d-%02d-%02d %02d:%02d:%02d.%03ld]",
-             tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
-             tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec,
-             tv.tv_usec / 1000);
+    if (size >= 30) {  /* 确保缓冲区足够大 */
+        snprintf(buffer, size, "[%04d-%02d-%02d %02d:%02d:%02d.%03ld]",
+                 tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+                 tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec,
+                 tv.tv_usec / 1000);
+    }
 }
 
 /* 初始化日志系统 */
