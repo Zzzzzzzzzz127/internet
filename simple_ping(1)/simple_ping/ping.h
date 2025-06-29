@@ -3,12 +3,12 @@
 #include	<netinet/ip_icmp.h>
 #include	<netinet/icmp6.h>
 #include	<netinet/ip6.h>
-#include	<sys/types.h>	/* basic system data types */
-#include	<sys/socket.h>	/* basic socket definitions */
-#include	<sys/time.h>	/* timeval{} for select() */
-#include	<time.h>		/* timespec{} for pselect() */
-#include	<netinet/in.h>	/* sockaddr_in{} and other Internet defns */
-#include	<arpa/inet.h>	/* inet(3) functions */
+#include	<sys/types.h>	/* 基本系统数据类型 */
+#include	<sys/socket.h>	/* 基本套接字定义 */
+#include	<sys/time.h>	/* select()使用的timeval{} */
+#include	<time.h>		/* pselect()使用的timespec{} */
+#include	<netinet/in.h>	/* sockaddr_in{}和其他Internet定义 */
+#include	<arpa/inet.h>	/* inet(3)函数 */
 #include	<netdb.h>
 #include	<signal.h>
 #include	<stdio.h>
@@ -17,7 +17,7 @@
 #include	<errno.h>
 #include 	<pwd.h>
 #include	<unistd.h>
-#include	<sys/un.h>		/* for Unix domain sockets */
+#include	<sys/un.h>		/* Unix域套接字 */
 #include	<sys/ioctl.h>
 #include	<net/if.h>
 #include <stdarg.h>
@@ -35,19 +35,19 @@
 #define BUFSIZE		1500
 #define MAXLINE         4096
 
-/* globals */
+/* 全局变量 */
 char	 recvbuf[BUFSIZE];
 char	 sendbuf[BUFSIZE];
 
-int    datalen;	/* #bytes of data, following ICMP header */
+int    datalen;	/* ICMP头后面的数据字节数 */
 char	*host;
-int	 nsent;			/* add 1 for each sendto() */
-pid_t pid;			/* our PID */
+int	 nsent;			/* 每次sendto()加1 */
+pid_t pid;			/* 进程ID */
 int	 sockfd;    //本地套接字
 int	 verbose;
-int    daemon_proc;            /* set nonzero by daemon_init() */
+int    daemon_proc;            /* daemon_init()设置为非零 */
 
-/* function prototypes */
+/* 函数原型 */
 void	 proc_v4(char *, ssize_t, struct timeval *);
 void	 proc_v6(char *, ssize_t, struct timeval *);
 void	 send_v4(void);
@@ -65,10 +65,10 @@ void err_sys(const char *fmt, ...);
 struct proto {
   void	 (*fproc)(char *, ssize_t, struct timeval *);
   void	 (*fsend)(void);
-  struct sockaddr  *sasend;	/* sockaddr{} for send, from getaddrinfo */
-  struct sockaddr  *sarecv;	/* sockaddr{} for receiving */
-  socklen_t	    salen;		/* length of sockaddr{}s */
-  int	   	    icmpproto;	/* IPPROTO_xxx value for ICMP */
+  struct sockaddr  *sasend;	/* 发送用的sockaddr{}，来自getaddrinfo */
+  struct sockaddr  *sarecv;	/* 接收用的sockaddr{} */
+  socklen_t	    salen;		/* sockaddr{}的长度 */
+  int	   	    icmpproto;	/* ICMP的IPPROTO_xxx值 */
 } *pr;
 /*消息格式，可以看到里面有
 1、2、根据不同ip类型（ipv4/ipv6）采用的不同首发函数
@@ -83,13 +83,13 @@ enum mismark{
     FREQNOTNUMBER
 };
 struct sdata{
-    int send;// label is 0
-    int recv;//label is 1
+    int send;// 标签为0
+    int recv;// 标签为1
     int size;
     int mxsize;
     double min;
     double max;
-    double *data;//label is 2;
+    double *data;// 标签为2
 };
 typedef struct sdata sdata;
 void sigint_handler(int sig);
@@ -123,29 +123,29 @@ void log_debug(const char *format, ...);
 void log_stats(const char *format, ...);
 void cleanup_log_system(void);
 void get_log_timestamp(char *buffer, size_t size);
-int freq=0; /*use for c*/
+int freq=0; /*用于c选项*/
 int willfreq=0;
-int flowing =0;/*use for flow*/
-int quiet=0;/*use for q*/
-int havethread=0;/*use for flow*/
-int broadcast=0;/*use for b - broadcast*/
-int audible=0;/*use for a - audible beep*/
-int timestamp=0;/*use for time - timestamp*/
-int ttl_value=0;/*use for t - TTL setting, IPv4 only*/
-int deadline=0;/*use for w - total runtime deadline in seconds*/
-time_t start_time=0;/*record program start time for deadline check*/
-int adaptive=0;/*use for A - adaptive ping mode*/
-double adaptive_interval=1.0;/*dynamic interval for adaptive mode*/
-double last_rtt=0.0;/*last RTT for adaptive calculation*/
-int packet_loss_count=0;/*count consecutive packet losses*/
-int interval=1;/*use for i - interval between packets in seconds*/
-char *data_string=NULL;/*use for data-string - custom data payload*/
-int custom_data=0;/*flag: whether using custom data string*/
-int json_output=0;/*use for json - JSON format output*/
-char *json_output_file=NULL;/*JSON output file path*/
-int log_output=0;/*use for log - log file output*/
-char *log_file_path=NULL;/*log file path*/
-FILE *log_fp=NULL;/*log file pointer*/
+int flowing =0;/*用于flow选项*/
+int quiet=0;/*用于q选项*/
+int havethread=0;/*用于flow选项*/
+int broadcast=0;/*用于b选项 - 广播*/
+int audible=0;/*用于a选项 - 声音提示*/
+int timestamp=0;/*用于time选项 - 时间戳*/
+int ttl_value=0;/*用于t选项 - TTL设置，仅IPv4*/
+int deadline=0;/*用于w选项 - 总运行时间截止期限(秒)*/
+time_t start_time=0;/*记录程序开始时间用于截止期限检查*/
+int adaptive=0;/*用于A选项 - 自适应ping模式*/
+double adaptive_interval=1.0;/*自适应模式的动态间隔*/
+double last_rtt=0.0;/*用于自适应计算的最后RTT*/
+int packet_loss_count=0;/*连续丢包计数*/
+int interval=1;/*用于i选项 - 数据包间隔时间(秒)*/
+char *data_string=NULL;/*用于data-string选项 - 自定义数据载荷*/
+int custom_data=0;/*标志：是否使用自定义数据字符串*/
+int json_output=0;/*用于json选项 - JSON格式输出*/
+char *json_output_file=NULL;/*JSON输出文件路径*/
+int log_output=0;/*用于log选项 - 日志文件输出*/
+char *log_file_path=NULL;/*日志文件路径*/
+FILE *log_fp=NULL;/*日志文件指针*/
 sdata sd;
 /*****************new add************/
 

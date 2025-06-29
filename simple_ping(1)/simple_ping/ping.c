@@ -8,7 +8,7 @@ struct proto	proto_v6 = { proc_v6, send_v6, NULL, NULL, 0, IPPROTO_ICMPV6 };
 #endif
 //同上 ipv6数据包
 
-int	datalen = 56;		/* data that goes with ICMP echo request */
+int	datalen = 56;		/* ICMP回显请求携带的数据长度 */
 
 int
 main(int argc, char **argv)
@@ -35,7 +35,7 @@ main(int argc, char **argv)
 		{0, 0, 0, 0}
 	};
 
-	opterr = 0;		/* don't want getopt() writing to stderr */
+	opterr = 0;		/* 不希望getopt()向stderr写入错误信息 */
 	while ( (c = getopt_long(argc, argv, "vc::fqhs:bat:Tw:Ai:", long_options, NULL)) != -1) {
 		//分析命令行参数的
 		switch (c) {
@@ -156,6 +156,8 @@ main(int argc, char **argv)
 		if (!verbose) {
 			quiet = 1;
 		}
+		/* JSON模式下显示一个进度提示 */
+		fprintf(stderr, "Running ping test (Press Ctrl+C to stop and see results)...\n");
 	}
 	
 	/* 初始化日志系统 */
@@ -189,7 +191,7 @@ main(int argc, char **argv)
 		   		Sock_ntop_host(ai->ai_addr, ai->ai_addrlen), datalen);
 	}
 
-		/* 4initialize according to protocol */
+		/* 根据协议类型进行初始化 */
 	if (ai->ai_family == AF_INET) {
 		pr = &proto_v4;
 #ifdef	IPV6
@@ -222,11 +224,11 @@ proc_v4(char *ptr, ssize_t len, struct timeval *tvrecv)
 	struct icmp		*icmp;
 	struct timeval	*tvsend;
 
-	ip = (struct ip *) ptr;		/* start of IP header */
-	hlen1 = ip->ip_hl << 2;		/* length of IP header */
+	ip = (struct ip *) ptr;		/* IP头部开始位置 */
+	hlen1 = ip->ip_hl << 2;		/* IP头部长度 */
 	//IP长度是以4字节为标准的？
 
-	icmp = (struct icmp *) (ptr + hlen1);	/* start of ICMP header */
+	icmp = (struct icmp *) (ptr + hlen1);	/* ICMP头部开始位置 */
 	//获得icmp数据包的头地址
 	if ( (icmplen = len - hlen1) < 8)
 		err_quit("icmplen (%d) < 8", icmplen);
@@ -235,14 +237,41 @@ proc_v4(char *ptr, ssize_t len, struct timeval *tvrecv)
 	//如果看到数据包是reply才接受，否则看一个标志量
 	if (icmp->icmp_type == ICMP_ECHOREPLY) {
 		if (icmp->icmp_id != pid)
-			return;			/* not a response to our ECHO_REQUEST */
+			return;			/* 不是对我们回显请求的响应 */
 		//检测标识符，这里应该是用进程pid来看的
 		if (icmplen < 16)
 			err_quit("icmplen (%d) < 16", icmplen);
 
 		tvsend = (struct timeval *) icmp->icmp_data;
+		
+		/* 调试：检查时间戳合理性 */
+		if (verbose) {
+			log_debug("Send timestamp: tv_sec=%ld, tv_usec=%ld", tvsend->tv_sec, tvsend->tv_usec);
+			log_debug("Recv timestamp: tv_sec=%ld, tv_usec=%ld", tvrecv->tv_sec, tvrecv->tv_usec);
+		}
+		
+		/* 检查发送时间戳的合理性 */
+		time_t current_time = time(NULL);
+		if (tvsend->tv_sec < 0 || tvsend->tv_sec > current_time + 3600 || 
+		    tvsend->tv_usec < 0 || tvsend->tv_usec >= 1000000) {
+			if (verbose) {
+				timestamp_printf("Warning: Invalid send timestamp, packet ignored\n");
+			}
+			return;  /* 忽略损坏的数据包 */
+		}
+		
 		tv_sub(tvrecv, tvsend);
 		rtt = tvrecv->tv_sec * 1000.0 + tvrecv->tv_usec / 1000.0;
+		
+		/* 检查RTT合理性 - 应该在0到60000ms之间 */
+		if (rtt < 0.0 || rtt > 60000.0) {
+			if (verbose) {
+				timestamp_printf("Warning: Invalid RTT %.3f ms (send: %ld.%06ld, recv: %ld.%06ld), packet ignored\n", 
+				                rtt, tvsend->tv_sec, tvsend->tv_usec, tvrecv->tv_sec, tvrecv->tv_usec);
+			}
+			log_error("Invalid RTT calculation: %.3f ms", rtt);
+			return;  /* 忽略这个异常的数据包 */
+		}
 		//服务器返回的时间戳是我们一开始发给他的
 		/***************change********** */
 		if(!flowing&&!quiet){
@@ -279,14 +308,31 @@ proc_v4(char *ptr, ssize_t len, struct timeval *tvrecv)
 			fflush(stdout);
 		}
 		
+		/* JSON模式下的进度提示 */
+		if (json_output && quiet) {
+			fprintf(stderr, ".");
+			fflush(stderr);
+		}
+		
 		sd.recv++;
-		sd.max=rtt>sd.max?rtt:sd.max;
-		sd.min=rtt<sd.min?rtt:sd.min;
+		/* 更新最大值和最小值 */
+		if (sd.recv == 1) {
+			/* 第一个RTT值，初始化min和max */
+			sd.min = rtt;
+			sd.max = rtt;
+		} else {
+			sd.max = (rtt > sd.max) ? rtt : sd.max;
+			sd.min = (rtt < sd.min) ? rtt : sd.min;
+		}
 		sd.data[sd.size]=rtt;
 		sd.size++;
 		
 		/* 适应性模式调整 */
 		if (adaptive) {
+			/* 如果有连续丢包，先处理丢包情况 */
+			if (packet_loss_count > 1) {
+				handle_packet_loss();
+			}
 			adjust_adaptive_interval(rtt);
 			packet_loss_count = 0; /* 收到回复，重置丢包计数 */
 		}
@@ -312,7 +358,7 @@ proc_v6(char *ptr, ssize_t len, struct timeval* tvrecv)
 	struct timeval		*tvsend;
 
 	/* 对于IPv6，我们需要处理IP头以获取hlim */
-	ip6 = (struct ip6_hdr *) ptr;		/* start of IPv6 header */
+	ip6 = (struct ip6_hdr *) ptr;		/* IPv6头部开始位置 */
 	hlen1 = sizeof(struct ip6_hdr);
 	
 	icmp6 = (struct icmp6_hdr *) (ptr + hlen1);
@@ -322,13 +368,40 @@ proc_v6(char *ptr, ssize_t len, struct timeval* tvrecv)
 
 	if (icmp6->icmp6_type == ICMP6_ECHO_REPLY) {
 		if (icmp6->icmp6_id != pid)
-			return;			/* not a response to our ECHO_REQUEST */
+			return;			/* 不是对我们回显请求的响应 */
 		if (icmp6len < 16)
 			err_quit("icmp6len (%d) < 16", icmp6len);
 
 		tvsend = (struct timeval *) (icmp6 + 1);
+		
+		/* 调试：检查时间戳合理性 */
+		if (verbose) {
+			log_debug("IPv6 Send timestamp: tv_sec=%ld, tv_usec=%ld", tvsend->tv_sec, tvsend->tv_usec);
+			log_debug("IPv6 Recv timestamp: tv_sec=%ld, tv_usec=%ld", tvrecv->tv_sec, tvrecv->tv_usec);
+		}
+		
+		/* 检查发送时间戳的合理性 */
+		time_t current_time = time(NULL);
+		if (tvsend->tv_sec < 0 || tvsend->tv_sec > current_time + 3600 || 
+		    tvsend->tv_usec < 0 || tvsend->tv_usec >= 1000000) {
+			if (verbose) {
+				timestamp_printf("Warning: Invalid IPv6 send timestamp, packet ignored\n");
+			}
+			return;  /* 忽略损坏的数据包 */
+		}
+		
 		tv_sub(tvrecv, tvsend);
 		rtt = tvrecv->tv_sec * 1000.0 + tvrecv->tv_usec / 1000.0;
+		
+		/* 检查RTT合理性 - 应该在0到60000ms之间 */
+		if (rtt < 0.0 || rtt > 60000.0) {
+			if (verbose) {
+				timestamp_printf("Warning: Invalid IPv6 RTT %.3f ms (send: %ld.%06ld, recv: %ld.%06ld), packet ignored\n", 
+				                rtt, tvsend->tv_sec, tvsend->tv_usec, tvrecv->tv_sec, tvrecv->tv_usec);
+			}
+			log_error("Invalid IPv6 RTT calculation: %.3f ms", rtt);
+			return;  /* 忽略这个异常的数据包 */
+		}
 		/***************change********** */
 		if(!flowing&&!quiet){
 			timestamp_printf("%d bytes from %s: seq=%u, hlim=%d, rtt=%.3f ms\n",
@@ -366,14 +439,31 @@ proc_v6(char *ptr, ssize_t len, struct timeval* tvrecv)
 			fflush(stdout);
 		}
 		
+		/* JSON模式下的进度提示 */
+		if (json_output && quiet) {
+			fprintf(stderr, ".");
+			fflush(stderr);
+		}
+		
 		sd.recv++;
-		sd.max=rtt>sd.max?rtt:sd.max;
-		sd.min=rtt<sd.min?rtt:sd.min;
+		/* 更新最大值和最小值 */
+		if (sd.recv == 1) {
+			/* 第一个RTT值，初始化min和max */
+			sd.min = rtt;
+			sd.max = rtt;
+		} else {
+			sd.max = (rtt > sd.max) ? rtt : sd.max;
+			sd.min = (rtt < sd.min) ? rtt : sd.min;
+		}
 		sd.data[sd.size]=rtt;
 		sd.size++;
 		
 		/* 适应性模式调整 */
 		if (adaptive) {
+			/* 如果有连续丢包，先处理丢包情况 */
+			if (packet_loss_count > 1) {
+				handle_packet_loss();
+			}
 			adjust_adaptive_interval(rtt);
 			packet_loss_count = 0; /* 收到回复，重置丢包计数 */
 		}
@@ -385,6 +475,26 @@ proc_v6(char *ptr, ssize_t len, struct timeval* tvrecv)
 		printf("    ICMPv6 Details:\n");
 		printf("      Type: %d, Code: %d\n", icmp6->icmp6_type, icmp6->icmp6_code);
 		printf("      Data Length: %d bytes\n", icmp6len - 8);
+		
+		/* 显示数据负载内容（如果有自定义数据字符串） */
+		if (custom_data && data_string && icmp6len > 16) {
+			printf("      Custom Data Payload: \"");
+			/* 显示时间戳后的数据部分 */
+			char *data_part = (char *)(icmp6 + 1) + 8;
+			int data_len = icmp6len - 16;  /* 减去ICMPv6头部8字节和时间戳8字节 */
+			
+			for (int i = 0; i < data_len && i < 50; i++) {  /* 最多显示50个字符 */
+				if (data_part[i] >= 32 && data_part[i] <= 126) {  /* 可打印字符 */
+					printf("%c", data_part[i]);
+				} else {
+					printf("\\x%02x", (unsigned char)data_part[i]);
+				}
+			}
+			if (data_len > 50) {
+				printf("...");
+			}
+			printf("\"\n");
+		}
 	}
 #endif	/* IPV6 */
 }
@@ -398,25 +508,24 @@ in_cksum(unsigned short *addr, int len)
         unsigned short  answer = 0;
 
         /*
-         * Our algorithm is simple, using a 32 bit accumulator (sum), we add
-         * sequential 16 bit words to it, and at the end, fold back all the
-         * carry bits from the top 16 bits into the lower 16 bits.
+         * 校验算法很简单：使用32位累加器(sum)，将16位字依次相加，
+         * 最后将高16位的进位折叠回低16位
          */
         while (nleft > 1)  {
                 sum += *w++;
                 nleft -= 2;
         }
 
-                /* 4mop up an odd byte, if necessary */
+                /* 如果需要的话，处理剩余的单个字节 */
         if (nleft == 1) {
                 *(unsigned char *)(&answer) = *(unsigned char *)w ;
                 sum += answer;
         }
 
-                /* 4add back carry outs from top 16 bits to low 16 bits */
-        sum = (sum >> 16) + (sum & 0xffff);     /* add hi 16 to low 16 */
-        sum += (sum >> 16);                     /* add carry */
-        answer = ~sum;                          /* truncate to 16 bits */
+                /* 将高16位的进位加回到低16位 */
+        sum = (sum >> 16) + (sum & 0xffff);     /* 将高16位加到低16位 */
+        sum += (sum >> 16);                     /* 加上进位 */
+        answer = ~sum;                          /* 截断为16位 */
         return(answer);
 }
 
@@ -443,7 +552,7 @@ send_v4(void)
 		fill_data_payload((char *)icmp->icmp_data + 8, datalen - 8);
 	}
 
-	len = 8 + datalen;		/* checksum ICMP header and data *///8个字节代表首部+data
+	len = 8 + datalen;		/* 对ICMP头部和数据进行校验 *///8个字节代表首部+data
 	icmp->icmp_cksum = 0;
 	icmp->icmp_cksum = in_cksum((u_short *) icmp, len);
 
@@ -482,14 +591,14 @@ send_v6()
 		fill_data_payload((char *)(icmp6 + 1) + 8, datalen - 8);
 	}
 
-	len = 8 + datalen;		/* 8-byte ICMPv6 header */
+	len = 8 + datalen;		/* 8字节的ICMPv6头部 */
 
 	sendto(sockfd, sendbuf, len, 0, pr->sasend, pr->salen);
 	
 	/* 记录IPv6发送日志 */
 	log_debug("Sent ICMPv6 packet: seq=%u, len=%d bytes", icmp6->icmp6_seq, len);
 	
-		/* kernel calculates and stores checksum for us */
+		/* 内核会为我们计算并存储校验和 */
 #endif	/* IPV6 */
 }
 
@@ -504,9 +613,12 @@ readloop(void)
 
 	sockfd = socket(pr->sasend->sa_family, SOCK_RAW, pr->icmpproto);
 	//创建套接字，选中地址的地址族，使用原始接口，协议号
-	setuid(getuid());		/* don't need special permissions any more */
+	if (sockfd < 0) {
+		err_sys("socket error - need root privileges to create raw socket");
+	}
+	setuid(getuid());		/* 不再需要特殊权限 */
 
-	size = 60 * 1024;		/* OK if setsockopt fails */
+	size = 60 * 1024;		/* 如果setsockopt失败也没关系 */
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
 	//socket，通用套接字选项，              发送缓冲区大小
 	
@@ -528,7 +640,7 @@ readloop(void)
 	} else if (broadcast && pr->sasend->sa_family == AF_INET6) {
 		timestamp_printf("Warning: broadcast option (-b) is not supported for IPv6\n");
 	}    
-	sig_alrm(SIGALRM);		/* send first packet */
+	sig_alrm(SIGALRM);		/* 发送第一个数据包 */
 
 	for ( ; ; ) {
 		len = pr->salen;
@@ -579,14 +691,11 @@ sig_alrm(int signo)
 					alarm(1);
 			}
 		}
-		else if(!willfreq){
+		        else if(!willfreq){
         	(*pr->fsend)();
         	if (adaptive) {
         		alarm((unsigned int)adaptive_interval);
-        		/* 如果在适应性模式下发送包，增加丢包计数（假设上一个包丢失） */
-        		if (packet_loss_count > 0) {
-        			handle_packet_loss();
-        		}
+        		/* 自适应模式下，每次发送都视为潜在的丢包（将在收到回复时重置） */
         		packet_loss_count++;
         	} else {
         		alarm(interval); /* 使用用户指定的间隔 */
@@ -597,6 +706,8 @@ sig_alrm(int signo)
 			(*pr->fsend)();
         	if (adaptive) {
         		alarm((unsigned int)adaptive_interval);
+        		/* 自适应模式下，每次发送都视为潜在的丢包（将在收到回复时重置） */
+        		packet_loss_count++;
         	} else {
         		alarm(interval); /* 使用用户指定的间隔 */
         	}
@@ -605,14 +716,14 @@ sig_alrm(int signo)
 		else
 			sigint_handler(SIGINT);
 		sd.send++;
-        return;         /* probably interrupts recvfrom() */
+        return;         /* 可能会中断recvfrom()调用 */
 /*******************change*********************** */
 }
 
 void
 tv_sub(struct timeval *out, struct timeval *in)
 {
-	if ( (out->tv_usec -= in->tv_usec) < 0) {	/* out -= in */
+	if ( (out->tv_usec -= in->tv_usec) < 0) {	/* out 减去 in */
 		--out->tv_sec;
 		out->tv_usec += 1000000;
 	}
@@ -625,7 +736,7 @@ tv_sub(struct timeval *out, struct timeval *in)
 char *
 sock_ntop_host(const struct sockaddr *sa, socklen_t salen)
 {
-    static char str[128];               /* Unix domain is largest */
+    static char str[128];               /* Unix域套接字地址最长 */
 
         switch (sa->sa_family) {
         case AF_INET: {
@@ -672,7 +783,7 @@ Sock_ntop_host(const struct sockaddr *sa, socklen_t salen)
         char    *ptr;
 
         if ( (ptr = sock_ntop_host(sa, salen)) == NULL)
-                err_sys("sock_ntop_host error");        /* inet_ntop() sets errno */
+                err_sys("sock_ntop_host error");        /* inet_ntop()会设置errno */
         return(ptr);
 }
 
@@ -683,16 +794,16 @@ host_serv(const char *host, const char *serv, int family, int socktype)
         struct addrinfo hints, *res;
 
         bzero(&hints, sizeof(struct addrinfo));
-        hints.ai_flags = AI_CANONNAME;  /* always return canonical name */
-        hints.ai_family = family;               /* AF_UNSPEC, AF_INET, AF_INET6, etc. */
-        hints.ai_socktype = socktype;   /* 0, SOCK_STREAM, SOCK_DGRAM, etc. */
+        hints.ai_flags = AI_CANONNAME;  /* 总是返回规范名称 */
+        hints.ai_family = family;               /* AF_UNSPEC, AF_INET, AF_INET6等 */
+        hints.ai_socktype = socktype;   /* 0, SOCK_STREAM, SOCK_DGRAM等 */
 		//要求返回规范主机名，根据family地址族返回不同的地址，socktype指定协议tcp/udp类型
         if ( (n = getaddrinfo(host, serv, &hints, &res)) != 0)
                 return(NULL);
 
-        return(res);    /* return pointer to first on linked list */
+        return(res);    /* 返回链表中第一个元素的指针 */
 }
-/* end host_serv */
+/* host_serv函数结束 */
 
 static void
 err_doit(int errnoflag, int level, const char *fmt, va_list ap)
@@ -700,11 +811,11 @@ err_doit(int errnoflag, int level, const char *fmt, va_list ap)
         int             errno_save, n;
         char    buf[MAXLINE];
 
-        errno_save = errno;             /* value caller might want printed */
+        errno_save = errno;             /* 调用者可能需要打印的值 */
 #ifdef  HAVE_VSNPRINTF
-        vsnprintf(buf, sizeof(buf), fmt, ap);   /* this is safe */
+        vsnprintf(buf, sizeof(buf), fmt, ap);   /* 这是安全的 */
 #else
-        vsprintf(buf, fmt, ap);                                 /* this is not safe */
+        vsprintf(buf, fmt, ap);                                 /* 这是不安全的 */
 #endif
         n = strlen(buf);
         if (errnoflag)
@@ -714,7 +825,7 @@ err_doit(int errnoflag, int level, const char *fmt, va_list ap)
         if (daemon_proc) {
                 syslog(level, "%s", buf);
         } else {
-                fflush(stdout);         /* in case stdout and stderr are the same */
+                fflush(stdout);         /* 防止stdout和stderr是同一个文件 */
                 fputs(buf, stderr);
                 fflush(stderr);
         }
@@ -722,8 +833,8 @@ err_doit(int errnoflag, int level, const char *fmt, va_list ap)
 }
 
 
-/* Fatal error unrelated to a system call.
- * Print a message and terminate. */
+/* 与系统调用无关的致命错误
+ * 打印消息并终止程序 */
 
 void
 err_quit(const char *fmt, ...)
@@ -736,8 +847,8 @@ err_quit(const char *fmt, ...)
         exit(1);
 }
 
-/* Fatal error related to a system call.
- * Print a message and terminate. */
+/* 与系统调用相关的致命错误
+ * 打印消息并终止程序 */
 
 void
 err_sys(const char *fmt, ...)
@@ -756,6 +867,7 @@ void sigint_handler(int sig){
 		
 		if (json_output) {
 			/* JSON模式输出 */
+			fprintf(stderr, "\n");  /* 清理进度提示行 */
 			output_json_results();
 		} else {
 			/* 传统文本模式输出 */
@@ -841,8 +953,8 @@ void init_sd(void){
 	sd.send=0;
 	sd.recv=0;
 	sd.data=(double*)malloc(sizeof(double)*1000);
-	sd.min=100000;
-	sd.max=0;
+	sd.min=999999.0;  /* 初始化为一个大值，会被第一个有效RTT替换 */
+	sd.max=0.0;
 	sd.mxsize=1;
 }
 void* pthread_fun(void* arg)
@@ -969,6 +1081,26 @@ void print_icmp_verbose(struct icmp *icmp, int icmplen){
     printf("      ID: %d, Sequence: %d\n", icmp->icmp_id, icmp->icmp_seq);
     printf("      Checksum: 0x%04x, Data Length: %d bytes\n",
            icmp->icmp_cksum, icmplen - 8);
+    
+    /* 显示数据负载内容（如果有自定义数据字符串） */
+    if (custom_data && data_string && icmplen > 16) {
+        printf("      Custom Data Payload: \"");
+        /* 显示时间戳后的数据部分 */
+        char *data_part = (char *)icmp->icmp_data + 8;
+        int data_len = icmplen - 16;  /* 减去ICMP头部8字节和时间戳8字节 */
+        
+        for (int i = 0; i < data_len && i < 50; i++) {  /* 最多显示50个字符 */
+            if (data_part[i] >= 32 && data_part[i] <= 126) {  /* 可打印字符 */
+                printf("%c", data_part[i]);
+            } else {
+                printf("\\x%02x", (unsigned char)data_part[i]);
+            }
+        }
+        if (data_len > 50) {
+            printf("...");
+        }
+        printf("\"\n");
+    }
 }
 
 /* 适应性间隔调整函数 */
@@ -1016,15 +1148,22 @@ void adjust_adaptive_interval(double rtt) {
 
 /* 处理丢包情况 */
 void handle_packet_loss(void) {
-    /* 丢包时增加发送间隔，减少网络负载 */
-    adaptive_interval = adaptive_interval * 1.8;
+    /* 连续丢包时，根据丢包次数逐步增加发送间隔 */
+    if (packet_loss_count == 1) {
+        adaptive_interval = adaptive_interval * 1.2;  /* 第一次丢包，适度增加 */
+    } else if (packet_loss_count <= 3) {
+        adaptive_interval = adaptive_interval * 1.5;  /* 连续丢包，进一步增加 */
+    } else {
+        adaptive_interval = adaptive_interval * 2.0;  /* 严重丢包，大幅增加 */
+    }
+    
     if (adaptive_interval > 10.0) {
         adaptive_interval = 10.0; /* 最大间隔10秒 */
     }
     
     if (verbose && !quiet) {
-        timestamp_printf("    Packet loss detected, interval increased to %.2f seconds\n", 
-                        adaptive_interval);
+        timestamp_printf("    Packet loss detected (count: %d), interval adjusted to %.2f seconds\n", 
+                        packet_loss_count, adaptive_interval);
     }
 }
 
@@ -1065,7 +1204,7 @@ void get_iso_timestamp(char *buffer, size_t size) {
     strftime(buffer, size, "%Y-%m-%dT%H:%M:%S", tm_info);
     
     /* 添加毫秒精度 */
-    char ms_buffer[16];
+    char ms_buffer[32];
     snprintf(ms_buffer, sizeof(ms_buffer), ".%03ld", tv.tv_usec / 1000);
     strncat(buffer, ms_buffer, size - strlen(buffer) - 1);
     strncat(buffer, "Z", size - strlen(buffer) - 1);
@@ -1246,12 +1385,12 @@ int init_log_system(const char *log_path) {
         return -1;
     }
     
-    log_fp = fopen(log_path, "a");  /* 追加模式 */
+    log_fp = fopen(log_path, "a");  /* 以追加模式打开 */
     if (!log_fp) {
         return -1;
     }
     
-    /* 设置行缓冲模式，确保实时写入 */
+    /* 设置行缓冲模式，确保立即写入 */
     setvbuf(log_fp, NULL, _IOLBF, 0);
     
     return 0;
@@ -1276,7 +1415,7 @@ void write_log(const char *level, const char *format, ...) {
     va_end(args);
     
     fprintf(log_fp, "\n");
-    fflush(log_fp);  /* 确保立即刷新到文件 */
+    fflush(log_fp);  /* 确保立即将数据刷新到文件 */
 }
 
 /* 便捷日志函数 */
@@ -1329,7 +1468,7 @@ void log_error(const char *format, ...) {
 }
 
 void log_debug(const char *format, ...) {
-    if (!log_output || !verbose) return;  /* 只在详细模式下记录DEBUG */
+    if (!log_output || !verbose) return;  /* 只在详细模式下记录调试信息 */
     
     va_list args;
     va_start(args, format);
