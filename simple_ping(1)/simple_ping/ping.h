@@ -1,3 +1,6 @@
+#ifndef PING_H
+#define PING_H
+
 #include 	<netinet/in_systm.h>
 #include	<netinet/ip.h>
 #include	<netinet/ip_icmp.h>
@@ -149,3 +152,70 @@ FILE *log_fp=NULL;/*日志文件指针*/
 sdata sd;
 /*****************new add************/
 
+/* 新增功能的全局变量 */
+char *interface_name = NULL;     /* 用于--interface选项 - 指定网卡 */
+int show_checksum = 0;           /* 用于--checksum选项 - 显示校验和 */
+int resolve_only = 0;            /* 用于--resolve-only选项 - 只解析域名 */
+int loss_threshold = 0;          /* 用于--loss-threshold选项 - 丢包阈值 */
+int color_output = 0;            /* 用于--color选项 - 彩色输出 */
+int rtt_graph = 0;               /* 用于--rtt-graph选项 - RTT图表 */
+int raw_output = 0;              /* 用于--raw选项 - 显示原始数据 */
+int no_dns = 0;                  /* 用于--no-dns选项 - 不进行DNS解析 */
+int uid_check = 0;               /* 用于--uid-check选项 - 检查用户权限 */
+int export_csv = 0;              /* 用于--export-csv选项 - CSV输出 */
+char *csv_file = NULL;           /* CSV输出文件路径 */
+FILE *csv_fp = NULL;             /* CSV文件指针 */
+
+/* RTT图表相关 */
+#define GRAPH_WIDTH 50
+#define GRAPH_HEIGHT 10
+double rtt_history[100];         /* RTT历史记录用于图表 */
+int rtt_history_count = 0;
+
+/* 新增函数声明 */
+int bind_to_interface(int sockfd, const char *ifname);
+void print_checksum(unsigned short cksum);
+void resolve_host_only(const char *hostname);
+void check_loss_threshold(void);
+void print_colored_rtt(double rtt);
+void update_rtt_graph(double rtt);
+void print_rtt_graph(void);
+void print_raw_packet(char *packet, ssize_t len);
+void check_uid_permissions(void);
+int init_csv_output(const char *csv_path);
+void write_csv_header(void);
+void write_csv_row(int seq, double rtt, int ttl);
+void cleanup_csv_output(void);
+const char* get_color_code(double rtt);
+const char* get_color_reset(void);
+
+/* 新增功能2的全局变量 */
+int packet_size_sweep = 0;       /* 用于--packet-size-sweep选项 */
+int sweep_min_size = 8;          /* 扫描最小包大小 */
+int sweep_max_size = 1472;       /* 扫描最大包大小 */
+int sweep_step = 100;            /* 扫描步长 */
+int show_jitter = 0;             /* 用于--jitter选项 */
+char *pattern_str = NULL;        /* 用于--pattern选项 */
+unsigned char *pattern_data = NULL; /* 解析后的模式数据 */
+int pattern_len = 0;             /* 模式长度 */
+int flood_limit = 0;             /* 用于--flood-limit选项 */
+int flood_pps = 0;               /* 每秒包数限制 */
+int geo_location = 0;            /* 用于--geo-location选项 */
+
+/* 抖动计算相关 */
+double jitter_sum = 0.0;
+int jitter_count = 0;
+double last_rtt_for_jitter = -1.0;
+
+/* 新增功能2的函数声明 */
+void perform_packet_size_sweep(void);
+void calculate_jitter(double rtt);
+void display_jitter_stats(void);
+int parse_hex_pattern(const char *str);
+void fill_with_pattern(char *buffer, int len);
+void controlled_flood_mode(void);
+void show_geo_location(const char *ip_str);
+void estimate_geo_location(const char *ip_str, char *location, size_t len);
+int get_optimal_packet_size(void);
+
+#endif

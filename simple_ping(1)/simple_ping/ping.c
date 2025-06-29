@@ -27,6 +27,21 @@ main(int argc, char **argv)
 		{"json", no_argument, 0, 1001},
 		{"json-output", required_argument, 0, 1002},
 		{"log", required_argument, 0, 1003},
+		{"interface", required_argument, 0, 1004},
+		{"checksum", no_argument, 0, 1005},
+		{"resolve-only", no_argument, 0, 1006},
+		{"loss-threshold", required_argument, 0, 1007},
+		{"color", no_argument, 0, 1008},
+		{"rtt-graph", no_argument, 0, 1009},
+		{"raw", no_argument, 0, 1010},
+		{"no-dns", no_argument, 0, 1011},
+		{"uid-check", no_argument, 0, 1012},
+		{"export-csv", required_argument, 0, 1013},
+		{"packet-size-sweep", no_argument, 0, 1014},
+		{"jitter", no_argument, 0, 1015},
+		{"pattern", required_argument, 0, 1016},
+		{"flood-limit", required_argument, 0, 1017},
+		{"geo-location", no_argument, 0, 1018},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
@@ -113,6 +128,64 @@ main(int argc, char **argv)
 			log_output = 1;
 			log_file_path = strdup(optarg);
 			break;
+		case 1004:  /* --interface */
+			interface_name = strdup(optarg);
+			break;
+		case 1005:  /* --checksum */
+			show_checksum = 1;
+			break;
+		case 1006:  /* --resolve-only */
+			resolve_only = 1;
+			break;
+		case 1007:  /* --loss-threshold */
+			loss_threshold = getnum(optarg);
+			if (loss_threshold < 0 || loss_threshold > 100) {
+				err_quit("invalid loss threshold: %d (must be 0-100)", loss_threshold);
+			}
+			break;
+		case 1008:  /* --color */
+			color_output = 1;
+			break;
+		case 1009:  /* --rtt-graph */
+			rtt_graph = 1;
+			break;
+		case 1010:  /* --raw */
+			raw_output = 1;
+			verbose = 1;  /* 原始输出需要详细模式 */
+			break;
+		case 1011:  /* --no-dns */
+			no_dns = 1;
+			break;
+		case 1012:  /* --uid-check */
+			uid_check = 1;
+			break;
+		case 1013:  /* --export-csv */
+			export_csv = 1;
+			csv_file = strdup(optarg);
+			break;
+		case 1014:  /* --packet-size-sweep */
+			packet_size_sweep = 1;
+			break;
+		case 1015:  /* --jitter */
+			show_jitter = 1;
+			break;
+		case 1016:  /* --pattern */
+			pattern_str = strdup(optarg);
+			if (parse_hex_pattern(pattern_str) < 0) {
+				err_quit("invalid hex pattern: %s", pattern_str);
+			}
+			custom_data = 1;
+			break;
+		case 1017:  /* --flood-limit */
+			flood_limit = 1;
+			flood_pps = getnum(optarg);
+			if (flood_pps <= 0 || flood_pps > 10000) {
+				err_quit("invalid flood limit: %d (must be 1-10000 pps)", flood_pps);
+			}
+			break;
+		case 1018:  /* --geo-location */
+			geo_location = 1;
+			break;
 /**************new add ***************************/
 		case '?':
 			err_quit("unrecognized option: %c", c);
@@ -123,6 +196,11 @@ main(int argc, char **argv)
 		err_quit("usage: ping [options] <hostname>");
 	host = argv[optind];
 	//host类似本地dns
+	
+	/* 检查用户权限 */
+	if (uid_check) {
+		check_uid_permissions();
+	}
 	
 	/* 检查选项冲突和智能交互 */
 	if (adaptive && interval != 1) {
@@ -167,14 +245,43 @@ main(int argc, char **argv)
 		}
 	}
 	
+	/* 初始化CSV输出 */
+	if (export_csv) {
+		if (init_csv_output(csv_file) != 0) {
+			fprintf(stderr, "Warning: Failed to initialize CSV output, CSV export disabled\n");
+			export_csv = 0;
+		} else {
+			write_csv_header();
+		}
+	}
+	
 	pid = getpid();
 	signal(SIGALRM, sig_alrm);
 	//第一个参数：用alarm函数设置的timer超时或setitimer函数设置的interval timer超时
 	//处理函数
 	//设置了一个闹钟信号及其对应的处理函数，触发后就无限发送了
 
+	/* 处理 no-dns 选项 */
+	if (no_dns) {
+		struct sockaddr_in addr;
+		if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+			err_quit("--no-dns specified but '%s' is not a valid IP address", host);
+		}
+	}
+	
 	ai = host_serv(host, NULL, 0, 0);
 	//主机名、端口号（icmp为不需要），不限制地址类型和协议类型
+	
+	/* 处理 resolve-only 选项 */
+	if (resolve_only) {
+		resolve_host_only(host);
+		exit(0);
+	}
+	
+	/* 显示地理位置信息 */
+	if (geo_location) {
+		show_geo_location(Sock_ntop_host(ai->ai_addr, ai->ai_addrlen));
+	}
 
 	if (custom_data && data_string) {
 		timestamp_printf("ping %s (%s) with data string \"%s\": %d data bytes\n", 
@@ -226,7 +333,18 @@ main(int argc, char **argv)
 		check_deadline();
 	}
 
-	readloop();
+	/* 执行数据包大小扫描 */
+	if (packet_size_sweep) {
+		perform_packet_size_sweep();
+		exit(0);
+	}
+	
+	/* 执行受控洪水模式 */
+	if (flood_limit) {
+		controlled_flood_mode();
+	} else {
+		readloop();
+	}
 
 	exit(0);
 }
@@ -307,14 +425,36 @@ proc_v4(char *ptr, ssize_t len, struct timeval *tvrecv)
 		//服务器返回的时间戳是我们一开始发给他的
 		/***************change********** */
 		if(!flowing&&!quiet){
-			if (ttl_value > 0) {
-				timestamp_printf("%d bytes from %s: seq=%u, reply_ttl=%d (sent_ttl=%d), rtt=%.3f ms\n",
-					icmplen, Sock_ntop_host(pr->sarecv, pr->salen),
-					icmp->icmp_seq, ip->ip_ttl, ttl_value, rtt);
+			if (color_output) {
+				/* 彩色输出 */
+				if (ttl_value > 0) {
+					timestamp_printf("%d bytes from %s: seq=%u, reply_ttl=%d (sent_ttl=%d), rtt=%s%.3f ms%s",
+						icmplen, Sock_ntop_host(pr->sarecv, pr->salen),
+						icmp->icmp_seq, ip->ip_ttl, ttl_value, get_color_code(rtt), rtt, get_color_reset());
+				} else {
+					timestamp_printf("%d bytes from %s: seq=%u, ttl=%d, rtt=%s%.3f ms%s",
+						icmplen, Sock_ntop_host(pr->sarecv, pr->salen),
+						icmp->icmp_seq, ip->ip_ttl, get_color_code(rtt), rtt, get_color_reset());
+				}
+				if (show_checksum) {
+					printf(" [checksum=0x%04x]", ntohs(icmp->icmp_cksum));
+				}
+				printf("\n");
 			} else {
-				timestamp_printf("%d bytes from %s: seq=%u, ttl=%d, rtt=%.3f ms\n",
-					icmplen, Sock_ntop_host(pr->sarecv, pr->salen),
-					icmp->icmp_seq, ip->ip_ttl, rtt);
+				/* 普通输出 */
+				if (ttl_value > 0) {
+					timestamp_printf("%d bytes from %s: seq=%u, reply_ttl=%d (sent_ttl=%d), rtt=%.3f ms",
+						icmplen, Sock_ntop_host(pr->sarecv, pr->salen),
+						icmp->icmp_seq, ip->ip_ttl, ttl_value, rtt);
+				} else {
+					timestamp_printf("%d bytes from %s: seq=%u, ttl=%d, rtt=%.3f ms",
+						icmplen, Sock_ntop_host(pr->sarecv, pr->salen),
+						icmp->icmp_seq, ip->ip_ttl, rtt);
+				}
+				if (show_checksum) {
+					printf(" [checksum=0x%04x]", ntohs(icmp->icmp_cksum));
+				}
+				printf("\n");
 			}
 		}
 		
@@ -370,6 +510,27 @@ proc_v4(char *ptr, ssize_t len, struct timeval *tvrecv)
 		}
 		sd.data[sd.size]=rtt;
 		sd.size++;
+		
+		/* 写入CSV数据 */
+		if (export_csv) {
+			write_csv_row(icmp->icmp_seq, rtt, ip->ip_ttl);
+		}
+		
+		/* 更新RTT图表 */
+		if (rtt_graph) {
+			update_rtt_graph(rtt);
+		}
+		
+		/* 计算抖动 */
+		if (show_jitter) {
+			calculate_jitter(rtt);
+		}
+		
+		/* 显示原始数据包 */
+		if (raw_output) {
+			timestamp_printf("    Raw ICMP packet (hex):\n");
+			print_raw_packet(ptr, len);
+		}
 		
 		/* 适应性模式调整 */
 		if (adaptive) {
@@ -470,9 +631,25 @@ proc_v6(char *ptr, ssize_t len, struct timeval* tvrecv)
 		}
 		/***************change********** */
 		if(!flowing&&!quiet){
-			timestamp_printf("%d bytes from %s: seq=%u, hlim=%d, rtt=%.3f ms\n",
-				icmp6len, Sock_ntop_host(pr->sarecv, pr->salen),
-				icmp6->icmp6_seq, ip6->ip6_hlim, rtt);
+			if (color_output) {
+				/* 彩色输出 */
+				timestamp_printf("%d bytes from %s: seq=%u, hlim=%d, rtt=%s%.3f ms%s",
+					icmp6len, Sock_ntop_host(pr->sarecv, pr->salen),
+					icmp6->icmp6_seq, ip6->ip6_hlim, get_color_code(rtt), rtt, get_color_reset());
+				if (show_checksum) {
+					printf(" [checksum=0x%04x]", ntohs(icmp6->icmp6_cksum));
+				}
+				printf("\n");
+			} else {
+				/* 普通输出 */
+				timestamp_printf("%d bytes from %s: seq=%u, hlim=%d, rtt=%.3f ms",
+					icmp6len, Sock_ntop_host(pr->sarecv, pr->salen),
+					icmp6->icmp6_seq, ip6->ip6_hlim, rtt);
+				if (show_checksum) {
+					printf(" [checksum=0x%04x]", ntohs(icmp6->icmp6_cksum));
+				}
+				printf("\n");
+			}
 		}
 		
 		/* 记录IPv6 ping响应日志 */
@@ -523,6 +700,27 @@ proc_v6(char *ptr, ssize_t len, struct timeval* tvrecv)
 		}
 		sd.data[sd.size]=rtt;
 		sd.size++;
+		
+		/* 写入CSV数据 */
+		if (export_csv) {
+			write_csv_row(icmp6->icmp6_seq, rtt, ip6->ip6_hlim);
+		}
+		
+		/* 更新RTT图表 */
+		if (rtt_graph) {
+			update_rtt_graph(rtt);
+		}
+		
+		/* 计算抖动 */
+		if (show_jitter) {
+			calculate_jitter(rtt);
+		}
+		
+		/* 显示原始数据包 */
+		if (raw_output) {
+			timestamp_printf("    Raw ICMPv6 packet (hex):\n");
+			print_raw_packet(ptr, len);
+		}
 		
 		/* 适应性模式调整 */
 		if (adaptive) {
@@ -713,6 +911,14 @@ readloop(void)
 		err_sys("socket error - need root privileges to create raw socket");
 	}
 	setuid(getuid());		/* 不再需要特殊权限 */
+	
+	/* 绑定到指定网卡 */
+	if (interface_name) {
+		if (bind_to_interface(sockfd, interface_name) < 0) {
+			err_quit("Failed to bind to interface %s", interface_name);
+		}
+		timestamp_printf("Bound to interface: %s\n", interface_name);
+	}
 
 	size = 60 * 1024;		/* 如果setsockopt失败也没关系 */
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
@@ -1023,6 +1229,22 @@ void sigint_handler(int sig){
 				timestamp_printf("round-trip min/avg/max = %.3f/%.3f/%.3f ms\n",
 				   sd.min, avg, sd.max);
 			}
+			
+			/* 显示RTT图表 */
+			if (rtt_graph && rtt_history_count > 0) {
+				timestamp_printf("\nRTT Graph:\n");
+				print_rtt_graph();
+			}
+			
+			/* 检查丢包阈值 */
+			if (loss_threshold > 0) {
+				check_loss_threshold();
+			}
+			
+			/* 显示抖动统计 */
+			if (show_jitter && jitter_count > 0) {
+				display_jitter_stats();
+			}
 		}
 		
 		/* 记录统计日志 */
@@ -1048,6 +1270,11 @@ void sigint_handler(int sig){
 	/* 清理日志系统 */
 	if (log_output) {
 		cleanup_log_system();
+	}
+	
+	/* 清理CSV输出 */
+	if (export_csv) {
+		cleanup_csv_output();
 	}
 	
 	exit(1);
@@ -1114,6 +1341,21 @@ void show_help(void){
     printf("  --json      以JSON格式输出统计结果\n");
     printf("  --json-output <文件>  将JSON结果保存到文件\n");
     printf("  --log <文件>  将ping过程记录到日志文件\n");
+    printf("  --interface <网卡>  指定从哪个网卡发包 (如 eth0)\n");
+    printf("  --checksum  显示每个ICMP包的校验和\n");
+    printf("  --resolve-only  只解析域名，不发送ping\n");
+    printf("  --loss-threshold <百分比>  若丢包超过该阈值则提示告警 (0-100)\n");
+    printf("  --color     输出时不同颜色显示延迟结果\n");
+    printf("  --rtt-graph 实时绘制简单RTT折线图\n");
+    printf("  --raw       显示接收的ICMP报文十六进制内容\n");
+    printf("  --no-dns    不进行域名解析，只接受IP地址\n");
+    printf("  --uid-check 输出当前运行用户ID，检测权限\n");
+    printf("  --export-csv <文件>  将ping数据输出成CSV格式\n");
+    printf("  --packet-size-sweep  自动测试不同大小的数据包\n");
+    printf("  --jitter    显示抖动（延迟变化）统计\n");
+    printf("  --pattern <hex>  使用指定的十六进制模式填充数据包\n");
+    printf("  --flood-limit <pps>  以指定的包/秒速率发送\n");
+    printf("  --geo-location  显示目标地理位置信息\n");
     printf("\n使用示例:\n");
     printf("  ping baidu.com\n");
     printf("  ping -c 4 -s 1000 baidu.com\n");
@@ -1130,6 +1372,21 @@ void show_help(void){
     printf("  ping --json-output results.json -c 10 baidu.com\n");
     printf("  ping --log network.log -c 5 baidu.com\n");
     printf("  ping --log debug.log -v -T baidu.com\n");
+    printf("  ping --interface eth0 baidu.com\n");
+    printf("  ping --checksum baidu.com\n");
+    printf("  ping --resolve-only www.baidu.com\n");
+    printf("  ping -c 10 --loss-threshold 20 baidu.com\n");
+    printf("  ping --color baidu.com\n");
+    printf("  ping -c 10 --rtt-graph baidu.com\n");
+    printf("  ping -c 1 --raw baidu.com\n");
+    printf("  ping --no-dns 8.8.8.8\n");
+    printf("  ping --uid-check baidu.com\n");
+    printf("  ping --export-csv ping_data.csv baidu.com\n");
+    printf("  ping --packet-size-sweep baidu.com\n");
+    printf("  ping --jitter baidu.com\n");
+    printf("  ping --pattern deadbeef baidu.com\n");
+    printf("  ping --flood-limit 100 baidu.com\n");
+    printf("  ping --geo-location baidu.com\n");
 }
 
 int validate_data_size(int size){
@@ -1353,7 +1610,9 @@ void handle_packet_loss(void) {
 
 /* 数据负载填充函数 */
 void fill_data_payload(char *buffer, int len) {
-    if (custom_data && data_string) {
+    if (pattern_data && pattern_len > 0) {
+        fill_with_pattern(buffer, len);
+    } else if (custom_data && data_string) {
         fill_with_string(buffer, len, data_string);
     } else {
         /* 默认填充模式 - 使用递增的字节值 */
@@ -1681,6 +1940,529 @@ void cleanup_log_system(void) {
         fclose(log_fp);
         log_fp = NULL;
     }
+}
+
+/* 绑定到指定网卡 */
+int bind_to_interface(int sockfd, const char *ifname) {
+#ifdef SO_BINDTODEVICE
+    return setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname));
+#else
+    /* Windows系统不支持SO_BINDTODEVICE */
+    fprintf(stderr, "Warning: --interface option is not supported on this platform\n");
+    return 0;
+#endif
+}
+
+/* 显示校验和 */
+void print_checksum(unsigned short cksum) {
+    printf(" [checksum=0x%04x]", ntohs(cksum));
+}
+
+/* 只解析域名 */
+void resolve_host_only(const char *hostname) {
+    struct addrinfo *ai;
+    char str[128];
+    
+    timestamp_printf("Resolving %s...\n", hostname);
+    
+    ai = host_serv(hostname, NULL, 0, 0);
+    if (ai == NULL) {
+        timestamp_printf("Failed to resolve %s\n", hostname);
+        return;
+    }
+    
+    timestamp_printf("Host: %s\n", hostname);
+    timestamp_printf("Canonical name: %s\n", ai->ai_canonname ? ai->ai_canonname : hostname);
+    
+    /* 显示所有解析到的地址 */
+    struct addrinfo *p;
+    int count = 0;
+    for (p = ai; p != NULL; p = p->ai_next) {
+        if (sock_ntop_host(p->ai_addr, p->ai_addrlen) != NULL) {
+            timestamp_printf("Address %d: %s\n", ++count, 
+                           sock_ntop_host(p->ai_addr, p->ai_addrlen));
+        }
+    }
+    
+    if (count == 0) {
+        timestamp_printf("No addresses found\n");
+    }
+    
+    freeaddrinfo(ai);
+}
+
+/* 检查丢包阈值 */
+void check_loss_threshold(void) {
+    double loss_percent = 0.0;
+    
+    if (sd.send > 0) {
+        loss_percent = (1.0 - (double)sd.recv / sd.send) * 100.0;
+    }
+    
+    if (loss_percent > loss_threshold) {
+        timestamp_printf("\n⚠️  WARNING: Packet loss (%.1f%%) exceeds threshold (%d%%)\n", 
+                        loss_percent, loss_threshold);
+        if (!quiet) {
+            printf("\a");  /* 发出警告声 */
+            fflush(stdout);
+        }
+    } else {
+        timestamp_printf("\n✅ Packet loss (%.1f%%) is within acceptable threshold (%d%%)\n", 
+                        loss_percent, loss_threshold);
+    }
+}
+
+/* 获取颜色代码 */
+const char* get_color_code(double rtt) {
+    if (rtt < 50.0) {
+        return "\033[32m";  /* 绿色 - 低延迟 */
+    } else if (rtt < 150.0) {
+        return "\033[33m";  /* 黄色 - 中等延迟 */
+    } else {
+        return "\033[31m";  /* 红色 - 高延迟 */
+    }
+}
+
+/* 获取颜色重置代码 */
+const char* get_color_reset(void) {
+    return "\033[0m";
+}
+
+/* 打印彩色RTT */
+void print_colored_rtt(double rtt) {
+    printf("%s%.3f ms%s", get_color_code(rtt), rtt, get_color_reset());
+}
+
+/* 更新RTT图表数据 */
+void update_rtt_graph(double rtt) {
+    if (rtt_history_count < 100) {
+        rtt_history[rtt_history_count++] = rtt;
+    } else {
+        /* 滚动数组 */
+        for (int i = 0; i < 99; i++) {
+            rtt_history[i] = rtt_history[i + 1];
+        }
+        rtt_history[99] = rtt;
+    }
+}
+
+/* 打印RTT图表 */
+void print_rtt_graph(void) {
+    if (rtt_history_count == 0) return;
+    
+    /* 找出最大和最小RTT值 */
+    double max_rtt = rtt_history[0];
+    double min_rtt = rtt_history[0];
+    
+    for (int i = 1; i < rtt_history_count; i++) {
+        if (rtt_history[i] > max_rtt) max_rtt = rtt_history[i];
+        if (rtt_history[i] < min_rtt) min_rtt = rtt_history[i];
+    }
+    
+    /* 打印图表 */
+    double range = max_rtt - min_rtt;
+    if (range < 1.0) range = 1.0;  /* 避免除零 */
+    
+    printf("RTT (ms)\n");
+    printf("%.1f ┤\n", max_rtt);
+    
+    /* 打印10行图表 */
+    for (int row = GRAPH_HEIGHT - 1; row >= 0; row--) {
+        printf("    │");
+        for (int col = 0; col < rtt_history_count && col < GRAPH_WIDTH; col++) {
+            double threshold = min_rtt + (range * row / GRAPH_HEIGHT);
+            if (rtt_history[col] >= threshold) {
+                printf("*");
+            } else {
+                printf(" ");
+            }
+        }
+        printf("\n");
+    }
+    
+    printf("%.1f ┴", min_rtt);
+    for (int i = 0; i < rtt_history_count && i < GRAPH_WIDTH; i++) {
+        printf("─");
+    }
+    printf("\n");
+    printf("     Time (packets) →\n");
+}
+
+/* 打印原始数据包 */
+void print_raw_packet(char *packet, ssize_t len) {
+    int i;
+    int lines = (len + 15) / 16;  /* 每行16字节 */
+    
+    for (int line = 0; line < lines; line++) {
+        printf("      %04x: ", line * 16);
+        
+        /* 打印十六进制 */
+        for (i = 0; i < 16; i++) {
+            if (line * 16 + i < len) {
+                printf("%02x ", (unsigned char)packet[line * 16 + i]);
+            } else {
+                printf("   ");
+            }
+            if (i == 7) printf(" ");  /* 中间加空格 */
+        }
+        
+        printf(" |");
+        
+        /* 打印ASCII字符 */
+        for (i = 0; i < 16 && line * 16 + i < len; i++) {
+            unsigned char ch = packet[line * 16 + i];
+            if (ch >= 32 && ch <= 126) {
+                printf("%c", ch);
+            } else {
+                printf(".");
+            }
+        }
+        printf("|\n");
+    }
+}
+
+/* 检查用户权限 */
+void check_uid_permissions(void) {
+    uid_t uid = getuid();
+    uid_t euid = geteuid();
+    struct passwd *pw = getpwuid(uid);
+    
+    timestamp_printf("User permission check:\n");
+    timestamp_printf("  Real UID: %d", uid);
+    if (pw) {
+        printf(" (%s)", pw->pw_name);
+    }
+    printf("\n");
+    timestamp_printf("  Effective UID: %d\n", euid);
+    
+    if (euid == 0) {
+        timestamp_printf("  Status: ✅ Running with root privileges (can create raw sockets)\n");
+    } else if (uid != euid) {
+        timestamp_printf("  Status: ⚠️  Running with setuid (limited privileges)\n");
+    } else {
+        timestamp_printf("  Status: ❌ Running as regular user (may need sudo for raw sockets)\n");
+    }
+}
+
+/* 初始化CSV输出 */
+int init_csv_output(const char *csv_path) {
+    if (!csv_path) {
+        return -1;
+    }
+    
+    csv_fp = fopen(csv_path, "w");
+    if (!csv_fp) {
+        return -1;
+    }
+    
+    /* 设置行缓冲模式 */
+    setvbuf(csv_fp, NULL, _IOLBF, 0);
+    
+    return 0;
+}
+
+/* 写入CSV头部 */
+void write_csv_header(void) {
+    if (!csv_fp) return;
+    
+    fprintf(csv_fp, "Timestamp,Sequence,RTT_ms,TTL,Host\n");
+    fflush(csv_fp);
+}
+
+/* 写入CSV数据行 */
+void write_csv_row(int seq, double rtt, int ttl) {
+    if (!csv_fp) return;
+    
+    char timestamp[64];
+    get_iso_timestamp(timestamp, sizeof(timestamp));
+    
+    fprintf(csv_fp, "%s,%d,%.3f,%d,%s\n", 
+            timestamp, seq, rtt, ttl, host);
+    fflush(csv_fp);
+}
+
+/* 清理CSV输出 */
+void cleanup_csv_output(void) {
+    if (csv_fp) {
+        /* 写入汇总信息作为注释 */
+        fprintf(csv_fp, "\n# Summary: %d packets sent, %d received, %.1f%% loss\n",
+                sd.send, sd.recv, 
+                sd.send > 0 ? (1.0 - (double)sd.recv / sd.send) * 100.0 : 0.0);
+        
+        if (sd.recv > 0) {
+            double sum = 0.0;
+            int count = sd.size > 1000 ? 1000 : sd.size;
+            for (int i = 0; i < count; i++) {
+                sum += sd.data[i];
+            }
+            double avg = sum / count;
+            
+            fprintf(csv_fp, "# RTT min/avg/max = %.3f/%.3f/%.3f ms\n",
+                    sd.min, avg, sd.max);
+        }
+        
+        fclose(csv_fp);
+        csv_fp = NULL;
+    }
+}
+
+/* 执行数据包大小扫描 */
+void perform_packet_size_sweep(void) {
+    int original_datalen = datalen;
+    int best_size = 0;
+    double best_rtt = 999999.0;
+    int sizes_tested = 0;
+    
+    timestamp_printf("Starting packet size sweep from %d to %d bytes (step %d)...\n", 
+                    sweep_min_size, sweep_max_size, sweep_step);
+    timestamp_printf("Size(bytes)  Sent  Recv  Loss%%  Avg RTT(ms)\n");
+    timestamp_printf("----------  ----  ----  -----  -----------\n");
+    
+    for (int size = sweep_min_size; size <= sweep_max_size; size += sweep_step) {
+        datalen = size;
+        sd.send = 0;
+        sd.recv = 0;
+        sd.size = 0;
+        double sum_rtt = 0.0;
+        
+        /* 每个大小发送5个包 */
+        for (int i = 0; i < 5; i++) {
+            (*pr->fsend)();
+            
+            /* 等待回复 */
+            fd_set rset;
+            struct timeval tv;
+            FD_ZERO(&rset);
+            FD_SET(sockfd, &rset);
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+            
+            if (select(sockfd + 1, &rset, NULL, NULL, &tv) > 0) {
+                char recvbuf[BUFSIZE];
+                socklen_t len = pr->salen;
+                ssize_t n = recvfrom(sockfd, recvbuf, sizeof(recvbuf), 0, pr->sarecv, &len);
+                if (n > 0) {
+                    struct timeval tval;
+                    gettimeofday(&tval, NULL);
+                    (*pr->fproc)(recvbuf, n, &tval);
+                }
+            }
+            
+            usleep(100000);  /* 100ms间隔 */
+        }
+        
+        /* 计算这个大小的平均RTT */
+        if (sd.recv > 0) {
+            for (int i = 0; i < sd.size && i < 5; i++) {
+                sum_rtt += sd.data[i];
+            }
+            double avg_rtt = sum_rtt / sd.recv;
+            double loss = sd.send > 0 ? (1.0 - (double)sd.recv / sd.send) * 100.0 : 0.0;
+            
+            timestamp_printf("%10d  %4d  %4d  %5.1f  %11.3f", 
+                           size, sd.send, sd.recv, loss, avg_rtt);
+            
+            if (sd.recv == sd.send && avg_rtt < best_rtt) {
+                best_rtt = avg_rtt;
+                best_size = size;
+                printf(" *");  /* 标记最佳 */
+            }
+            printf("\n");
+        } else {
+            timestamp_printf("%10d  %4d  %4d  100.0  -\n", size, sd.send, sd.recv);
+        }
+        
+        sizes_tested++;
+    }
+    
+    timestamp_printf("\nPacket size sweep complete. Tested %d sizes.\n", sizes_tested);
+    if (best_size > 0) {
+        timestamp_printf("Optimal packet size: %d bytes (RTT: %.3f ms)\n", best_size, best_rtt);
+    }
+    
+    datalen = original_datalen;  /* 恢复原始大小 */
+}
+
+/* 计算抖动 */
+void calculate_jitter(double rtt) {
+    if (last_rtt_for_jitter >= 0) {
+        double jitter = fabs(rtt - last_rtt_for_jitter);
+        jitter_sum += jitter;
+        jitter_count++;
+    }
+    last_rtt_for_jitter = rtt;
+}
+
+/* 显示抖动统计 */
+void display_jitter_stats(void) {
+    if (jitter_count > 0) {
+        double avg_jitter = jitter_sum / jitter_count;
+        timestamp_printf("\nJitter statistics:\n");
+        timestamp_printf("  Average jitter: %.3f ms\n", avg_jitter);
+        timestamp_printf("  Jitter samples: %d\n", jitter_count);
+        
+        /* 根据抖动值给出网络质量评估 */
+        if (avg_jitter < 5.0) {
+            timestamp_printf("  Network quality: Excellent (suitable for VoIP/gaming)\n");
+        } else if (avg_jitter < 20.0) {
+            timestamp_printf("  Network quality: Good (suitable for most applications)\n");
+        } else if (avg_jitter < 50.0) {
+            timestamp_printf("  Network quality: Fair (may affect real-time applications)\n");
+        } else {
+            timestamp_printf("  Network quality: Poor (high jitter detected)\n");
+        }
+    }
+}
+
+/* 解析十六进制模式 */
+int parse_hex_pattern(const char *str) {
+    int len = strlen(str);
+    if (len == 0 || len % 2 != 0) {
+        return -1;  /* 必须是偶数个字符 */
+    }
+    
+    pattern_len = len / 2;
+    pattern_data = (unsigned char *)malloc(pattern_len);
+    if (!pattern_data) {
+        return -1;
+    }
+    
+    for (int i = 0; i < pattern_len; i++) {
+        char hex[3] = {str[i*2], str[i*2+1], '\0'};
+        char *endptr;
+        long val = strtol(hex, &endptr, 16);
+        if (*endptr != '\0' || val < 0 || val > 255) {
+            free(pattern_data);
+            pattern_data = NULL;
+            return -1;
+        }
+        pattern_data[i] = (unsigned char)val;
+    }
+    
+    return 0;
+}
+
+/* 使用模式填充缓冲区 */
+void fill_with_pattern(char *buffer, int len) {
+    if (!pattern_data || pattern_len == 0) return;
+    
+    for (int i = 0; i < len; i++) {
+        buffer[i] = pattern_data[i % pattern_len];
+    }
+}
+
+/* 受控洪水模式 */
+void controlled_flood_mode(void) {
+    int interval_us = 1000000 / flood_pps;  /* 微秒间隔 */
+    struct timeval last_send, now;
+    
+    timestamp_printf("Starting controlled flood mode at %d pps (interval: %d us)\n", 
+                    flood_pps, interval_us);
+    timestamp_printf("Press Ctrl+C to stop...\n");
+    
+    gettimeofday(&last_send, NULL);
+    
+    for (;;) {
+        gettimeofday(&now, NULL);
+        
+        /* 计算距离上次发送的时间 */
+        long elapsed_us = (now.tv_sec - last_send.tv_sec) * 1000000 + 
+                         (now.tv_usec - last_send.tv_usec);
+        
+        if (elapsed_us >= interval_us) {
+            (*pr->fsend)();
+            last_send = now;
+            
+            if (!quiet) {
+                printf(".");
+                fflush(stdout);
+            }
+        }
+        
+        /* 非阻塞接收 */
+        fd_set rset;
+        struct timeval tv = {0, 1000};  /* 1ms超时 */
+        FD_ZERO(&rset);
+        FD_SET(sockfd, &rset);
+        
+        if (select(sockfd + 1, &rset, NULL, NULL, &tv) > 0) {
+            char recvbuf[BUFSIZE];
+            socklen_t len = pr->salen;
+            ssize_t n = recvfrom(sockfd, recvbuf, sizeof(recvbuf), 0, pr->sarecv, &len);
+            if (n > 0) {
+                struct timeval tval;
+                gettimeofday(&tval, NULL);
+                (*pr->fproc)(recvbuf, n, &tval);
+            }
+        }
+        
+        /* 检查是否需要退出 */
+        if (willfreq && sd.send >= freq) {
+            break;
+        }
+    }
+}
+
+/* 显示地理位置信息 */
+void show_geo_location(const char *ip_str) {
+    char location[256];
+    
+    timestamp_printf("Resolving geographic location for %s...\n", ip_str);
+    
+    estimate_geo_location(ip_str, location, sizeof(location));
+    
+    timestamp_printf("Estimated location: %s\n", location);
+    timestamp_printf("Note: Location is approximate based on IP address\n");
+}
+
+/* 估算地理位置（简化版本） */
+void estimate_geo_location(const char *ip_str, char *location, size_t len) {
+    struct in_addr addr;
+    
+    /* 这是一个简化的实现，实际应用中应该使用地理位置数据库 */
+    if (inet_pton(AF_INET, ip_str, &addr) == 1) {
+        unsigned char *bytes = (unsigned char *)&addr.s_addr;
+        
+        /* 基于IP地址范围的粗略估计 */
+        if (bytes[0] == 1) {
+            snprintf(location, len, "APNIC (Asia-Pacific)");
+        } else if (bytes[0] >= 2 && bytes[0] <= 5) {
+            snprintf(location, len, "ARIN (North America)");
+        } else if (bytes[0] >= 14 && bytes[0] <= 51) {
+            snprintf(location, len, "RIPE NCC (Europe/Middle East)");
+        } else if (bytes[0] >= 58 && bytes[0] <= 61) {
+            snprintf(location, len, "APNIC (Asia-Pacific)");
+        } else if (bytes[0] >= 62 && bytes[0] <= 79) {
+            snprintf(location, len, "RIPE NCC (Europe)");
+        } else if (bytes[0] >= 80 && bytes[0] <= 95) {
+            snprintf(location, len, "RIPE NCC (Europe)");
+        } else if (bytes[0] >= 96 && bytes[0] <= 127) {
+            snprintf(location, len, "ARIN (North America)");
+        } else if (bytes[0] >= 128 && bytes[0] <= 191) {
+            snprintf(location, len, "Various (Legacy allocations)");
+        } else if (bytes[0] >= 192 && bytes[0] <= 223) {
+            snprintf(location, len, "Various (Legacy Class C)");
+        } else {
+            snprintf(location, len, "Unknown/Reserved");
+        }
+        
+        /* 添加一些特殊的已知范围 */
+        if (bytes[0] == 8 && bytes[1] == 8) {
+            snprintf(location, len, "Google Public DNS (Global)");
+        } else if (bytes[0] == 1 && bytes[1] == 1) {
+            snprintf(location, len, "Cloudflare DNS (Global)");
+        } else if (strstr(ip_str, "114.114")) {
+            snprintf(location, len, "China (114 DNS)");
+        }
+    } else {
+        snprintf(location, len, "Unable to determine location");
+    }
+}
+
+/* 获取最佳数据包大小 */
+int get_optimal_packet_size(void) {
+    /* 这是一个占位函数，实际应该基于扫描结果 */
+    return 56;  /* 默认值 */
 }
 
 /********************add**************** */
