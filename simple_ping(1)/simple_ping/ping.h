@@ -22,7 +22,7 @@
 #include	<net/if.h>
 #include <stdarg.h>
 #include <syslog.h>
-#include <pthread.h>
+#include <sys/time.h>
 #include <assert.h>
 #include <getopt.h>
 #include <math.h>
@@ -98,7 +98,6 @@ int getnum(const char *str);
 void errorhandle(int m);
 void init_sd(void);
 void pushsd(int label,double num);
-void* pthread_fun(void *arg);
 void show_help(void);
 int validate_data_size(int size);
 char* get_timestamp(void);
@@ -129,7 +128,6 @@ int freq=0; /*用于c选项*/
 int willfreq=0;
 int flowing =0;/*用于flow选项*/
 int quiet=0;/*用于q选项*/
-int havethread=0;/*用于flow选项*/
 int broadcast=0;/*用于b选项 - 广播*/
 int audible=0;/*用于a选项 - 声音提示*/
 int timestamp=0;/*用于time选项 - 时间戳*/

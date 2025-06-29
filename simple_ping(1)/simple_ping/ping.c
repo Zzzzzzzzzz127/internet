@@ -32,7 +32,7 @@ main(int argc, char **argv)
 	};
 
 	opterr = 0;		/* 不希望getopt()向stderr写入错误信息 */
-	while ( (c = getopt_long(argc, argv, "vc::fqhs:bat:Tw:Ai:", long_options, NULL)) != -1) {
+	while ( (c = getopt_long(argc, argv, "vc:fqhs:bat:Tw:Ai:", long_options, NULL)) != -1) {
 		//分析命令行参数的
 		switch (c) {
 		case 'v':
@@ -636,6 +636,9 @@ send_v4(void)
 
 	sendto(sockfd, sendbuf, len, 0, pr->sasend, pr->salen);
 	
+	/* 统一的发送计数管理 */
+	sd.send++;
+	
 	/* 记录发送日志 */
 	if (verbose && log_output) {
 		log_debug("Sent ICMP packet: seq=%u, len=%d bytes", icmp->icmp_seq, len);
@@ -682,6 +685,9 @@ send_v6()
 	len = 8 + datalen;		/* 8字节的ICMPv6头部 */
 
 	sendto(sockfd, sendbuf, len, 0, pr->sasend, pr->salen);
+	
+	/* 统一的发送计数管理 */
+	sd.send++;
 	
 	/* 记录IPv6发送日志 */
 	if (verbose && log_output) {
@@ -773,81 +779,75 @@ void
 sig_alrm(int signo)
 {
 /*******************change*********************** */
-		/* 检查deadline */
-		if (deadline > 0) {
-			check_deadline();
+	/* 检查deadline */
+	if (deadline > 0) {
+		check_deadline();
+	}
+	
+	/* 自适应模式：如果再次收到alarm说明上一个包可能超时了 */
+	if (adaptive && sd.send > sd.recv) {
+		/* 有未收到回复的数据包，可能是超时了 */
+		int lost_packets = sd.send - sd.recv;
+		if (lost_packets > 0) {
+			packet_loss_count++;
+			if (verbose && !quiet) {
+				timestamp_printf("    Timeout detected, loss count: %d (sent: %d, recv: %d)\n", 
+				                packet_loss_count, sd.send, sd.recv);
+			}
+			
+			/* 处理连续丢包情况 */
+			if (packet_loss_count > 1) {
+				handle_packet_loss();
+			}
 		}
+	}
+	
+	/* 检查是否达到发送次数限制 */
+	if (willfreq && freq <= 0) {
+		/* 已经发送完指定次数，退出程序 */
+		sigint_handler(SIGINT);
+		return;
+	}
+	
+	/* 发送数据包 */
+	(*pr->fsend)();
+	/* 注意：sd.send的计数现在在send_v4/send_v6函数中进行 */
+	
+	/* 如果指定了发送次数，减少剩余次数 */
+	if (willfreq) {
+		freq--;
+	}
+	
+	/* 设置下一次alarm */
+	if (adaptive) {
+		/* 确保自适应间隔至少为0.1秒，避免过快发送 */
+		double next_interval = adaptive_interval;
+		if (flowing) {
+			next_interval = 0.2;  /* 流模式下使用200ms间隔，快速但可靠 */
+		}
+		if (next_interval < 0.1) next_interval = 0.1;  /* 最小100ms */
 		
-		/* 自适应模式：如果再次收到alarm说明上一个包可能超时了 */
-		if (adaptive && sd.send > sd.recv) {
-			/* 有未收到回复的数据包，可能是超时了 */
-			int lost_packets = sd.send - sd.recv;
-			if (lost_packets > 0) {
-				packet_loss_count++;
-				if (verbose && !quiet) {
-					timestamp_printf("    Timeout detected, loss count: %d (sent: %d, recv: %d)\n", 
-					                packet_loss_count, sd.send, sd.recv);
-				}
-				
-				/* 处理连续丢包情况 */
-				if (packet_loss_count > 1) {
-					handle_packet_loss();
-				}
-			}
-		}
-		
-		pthread_t tid;
-		if(flowing){
-			if(!havethread){
-				havethread=1;
-				sd.send--;
-    			int res = pthread_create(&tid,NULL,pthread_fun,NULL);
-    			assert(res == 0);
-				alarm(1);
-			}
-			else{
-				if(!freq&&willfreq){
-					pthread_join(tid,NULL);
-					sigint_handler(SIGINT);
-				}
-				else if(willfreq)
-					alarm(1);
-			}
-		}
-		        else if(!willfreq){
-        	(*pr->fsend)();
-        	if (adaptive) {
-        		/* 确保自适应间隔至少为1秒，避免alarm(0)导致停止发送 */
-        		unsigned int alarm_interval = (unsigned int)(adaptive_interval + 0.5);  /* 四舍五入 */
-        		if (alarm_interval < 1) alarm_interval = 1;  /* 最小1秒 */
-        		alarm(alarm_interval);
-        		
-        		/* 只有在真正没收到回复时才算丢包，而不是每次发送都增加 */
-        		/* packet_loss_count的增加放到真正的超时处理中 */
-        	} else {
-        		alarm(interval); /* 使用用户指定的间隔 */
-        	}
-			//发送后在指定间隔后发一个闹钟信号
-		}
-		else if(willfreq&&freq){
-			(*pr->fsend)();
-        	if (adaptive) {
-        		/* 确保自适应间隔至少为1秒，避免alarm(0)导致停止发送 */
-        		unsigned int alarm_interval = (unsigned int)(adaptive_interval + 0.5);  /* 四舍五入 */
-        		if (alarm_interval < 1) alarm_interval = 1;  /* 最小1秒 */
-        		alarm(alarm_interval);
-        		
-        		/* 只有在真正没收到回复时才算丢包，而不是每次发送都增加 */
-        		/* packet_loss_count的增加放到真正的超时处理中 */
-        	} else {
-        		alarm(interval); /* 使用用户指定的间隔 */
-        	}
-			freq--;
-		}
-		else
-			sigint_handler(SIGINT);
-		sd.send++;
-        return;         /* 可能会中断recvfrom()调用 */
+		unsigned int alarm_interval = (unsigned int)(next_interval * 1000000);  /* 转换为微秒 */
+		struct itimerval timer;
+		timer.it_value.tv_sec = alarm_interval / 1000000;
+		timer.it_value.tv_usec = alarm_interval % 1000000;
+		timer.it_interval.tv_sec = 0;
+		timer.it_interval.tv_usec = 0;
+		setitimer(ITIMER_REAL, &timer, NULL);
+	} else if (flowing) {
+		/* 流模式：使用200ms间隔实现快速但可靠的发送 */
+		struct itimerval timer;
+		timer.it_value.tv_sec = 0;
+		timer.it_value.tv_usec = 200000;  /* 200ms - 每秒5个包，快速但不会导致拥塞 */
+		timer.it_interval.tv_sec = 0;
+		timer.it_interval.tv_usec = 0;
+		setitimer(ITIMER_REAL, &timer, NULL);
+	} else {
+		/* 普通模式：使用指定间隔 */
+		alarm(interval);
+	}
+	
+	return;         /* 可能会中断recvfrom()调用 */
 /*******************change*********************** */
 }
 
@@ -1092,16 +1092,6 @@ void init_sd(void){
 	sd.min=999999.0;  /* 初始化为一个大值，会被第一个有效RTT替换 */
 	sd.max=0.0;
 	sd.mxsize=1;
-}
-void* pthread_fun(void* arg)
-{
-    do{
-		(*pr->fsend)();
-		sd.send++;
-		freq--;
-		printf(".");
-	}while(freq!=0);
-	pthread_exit(NULL);
 }
 
 void show_help(void){
